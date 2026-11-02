@@ -1,17 +1,13 @@
 {% extends "trading/base.html" %}
-{% block title %}Edit {{ strategy.name }} · Algo Trader{% endblock %}
+{% block title %}{{ strategy.symbol }} · Algo Trader{% endblock %}
 {% block content %}
-<div class="page-head"><h1>Edit strategy: {{ strategy.name }}</h1></div>
-<section class="card narrow-form">
-  <form method="post">{% csrf_token %}
-    {{ form.as_p }}
-    <button class="btn btn-primary">Save</button>
-    <a class="btn" href="{% url 'trading:strategies' %}">Cancel</a>
-  </form>
-</section>
-<section class="card narrow-form">
-  <form method="post" action="{% url 'trading:strategy_delete' strategy.pk %}" onsubmit="return confirm('Delete this strategy?');">{% csrf_token %}
-    <button class="btn btn-danger">Delete strategy</button>
-  </form>
-</section>
+<h1>{{ strategy.name }}</h1>
+<form method="post" class="stack">{% csrf_token %}
+  {{ form.non_field_errors }}
+  {% for field in form %}<label>{{ field.label }} {{ field }} {{ field.errors }}</label>{% endfor %}
+  <div><button class="btn dark">Save</button> <a class="btn" href="{% url 'trading:strategies' %}">Cancel</a></div>
+</form>
+<form method="post" action="{% url 'trading:strategy_delete' strategy.pk %}" onsubmit="return confirm('Delete this strategy?');" style="margin-top:32px">{% csrf_token %}
+  <button class="quiet err">Delete strategy</button>
+</form>
 {% endblock %}

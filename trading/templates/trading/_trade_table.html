@@ -1,20 +1,19 @@
-<div class="table-wrap">
+<div class="scroll">
 <table>
-  <thead><tr><th>Time</th><th>Symbol</th><th>Action</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th>Order ID</th><th>Note</th></tr></thead>
+  <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th>Note</th></tr></thead>
   <tbody>
   {% for t in trades %}
     <tr>
-      <td>{{ t.created_at|date:"Y-m-d H:i" }}</td>
-      <td>{{ t.symbol }}</td>
-      <td><span class="side side-{{ t.action|lower }}">{{ t.action }}</span></td>
+      <td class="muted">{{ t.created_at|date:"M j, H:i" }}</td>
+      <td><strong>{{ t.symbol }}</strong></td>
+      <td class="{% if t.action == 'BUY' %}up{% else %}down{% endif %}">{{ t.action }}</td>
       <td class="num">{{ t.quantity|floatformat:"-4" }}</td>
       <td class="num">{{ t.price|floatformat:2|default:"—" }}</td>
-      <td><span class="status status-{{ t.status|lower }}">{{ t.get_status_display }}</span></td>
-      <td class="mono">{{ t.order_id|default:"—" }}</td>
-      <td class="small">{{ t.message|truncatechars:80 }}</td>
+      <td class="status-{{ t.status|lower }}">{{ t.get_status_display }}</td>
+      <td class="note">{{ t.message|truncatechars:90 }}</td>
     </tr>
   {% empty %}
-    <tr><td colspan="8" class="muted">No trades yet.</td></tr>
+    <tr><td colspan="7" class="muted">No trades yet.</td></tr>
   {% endfor %}
   </tbody>
 </table>

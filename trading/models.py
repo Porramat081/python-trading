@@ -70,7 +70,7 @@ class StrategyConfig(models.Model):
     name = models.CharField(max_length=100)
     symbol = models.CharField(max_length=16, db_index=True)
     is_active = models.BooleanField(
-        default=False, help_text="Only active strategies are run by `run_strategy`."
+        default=False, help_text="Active strategies are run automatically by the scheduler."
     )
     short_window = models.PositiveIntegerField(default=10)
     long_window = models.PositiveIntegerField(default=50)
@@ -88,6 +88,7 @@ class StrategyConfig(models.Model):
     )
     last_run = models.DateTimeField(null=True, blank=True)
     last_signal = models.CharField(max_length=4, blank=True)
+    trend = models.CharField(max_length=4, blank=True, help_text="UP if short MA > long MA, else DOWN.")
     last_signal_bar = models.DateTimeField(
         null=True, blank=True, help_text="Candle time of the last signal acted on (prevents repeats)."
     )

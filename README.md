@@ -4,6 +4,8 @@ A private Django trading bot that:
 
 - **Backfills market data** from the [Massive](https://massive.com) (formerly Polygon.io) aggregates API into `StockData`.
 - **Runs a momentum strategy:** a moving-average crossover (SMA or EMA) computed with pandas.
+- **Fully automatic:** adding a strategy backfills its data, evaluates it, switches it ON and enters a position
+  if the trend is up. A built-in scheduler keeps every active strategy running during market hours.
 - **Places orders on Alpaca** through the [SnapTrade](https://snaptrade.com) API.
 - **Provides a web dashboard** (Django templates + Chart.js) and **Django admin** tools.
 
@@ -17,6 +19,7 @@ manage.py
 algo_trader/                 # project config (settings, urls, wsgi/asgi)
 trading/                     # main app: models, views, admin, templates, management commands
   management/commands/
+    run_scheduler.py         # python manage.py run_scheduler  (keeps active strategies running)
     run_strategy.py          # python manage.py run_strategy --symbol AAPL
     backfill_data.py         # python manage.py backfill_data --symbol AAPL --days 365
   templates/trading/         # dashboard.html, positions.html, strategies.html, ...
@@ -82,39 +85,63 @@ which syncs your accounts. You can also click **Sync accounts** at any time.
 
 ## Usage
 
-### 1. Create a strategy
+### 1. Add a strategy
 
-Use **Strategies** in the web UI, or the admin. Pick a symbol, SMA/EMA, short/long windows, the account that should
-receive orders, and the units per order. Use the **Auto** toggle to switch automated execution ON/OFF.
+On **Strategies**, type a symbol (e.g. `SPY`, `AAPL`, `MSFT`) and a quantity, then click **Add & start**. The MA
+type and windows (default SMA 10/50) and an optional name are under **Advanced**. If you have exactly one linked
+account, it is selected automatically.
 
-### 2. Backfill price data
+Adding a strategy automatically:
+
+1. **Backfills** about 2 years of daily candles from Massive.
+2. **Evaluates** the signal and the trend (short MA above the long MA = uptrend).
+3. **Switches the strategy ON.**
+4. **Enters a position (trend-based entry):**
+   - If the signal is BUY, or the trend is up and the signal isn't SELL, it **buys** the quantity now. It skips the
+     buy if you already hold the symbol.
+   - If the signal is SELL, or the trend is down, it **doesn't buy**. It waits for the next BUY crossover.
+
+The same happens when a strategy is added through the Django admin.
+
+### 2. Keep it running: the scheduler
+
+In a second terminal (with the virtual environment activated), run:
+
+```bash
+python manage.py run_scheduler
+```
+
+During US market hours (Mon–Fri 09:30–16:00 New York time), it refreshes recent candles and runs every **ON**
+strategy every 15 minutes. It also does one final run after the close, when the daily candle is complete. Leave it
+running next to `runserver`. Options:
+
+```bash
+python manage.py run_scheduler --interval 5
+```
+
+```bash
+python manage.py run_scheduler --once
+```
+
+`--ignore-market-hours` runs around the clock. Exchange holidays aren't detected; on those days the runs just
+find no new data.
+
+### Manual commands (optional)
 
 ```bash
 python manage.py backfill_data --symbol AAPL MSFT --days 730
 ```
-
-There are also buttons in the UI and admin (*Stock data → Backfill ticker*, plus admin actions). Candles already
-stored are skipped, so you can re-run backfills safely.
-
-### 3. Run the strategy
 
 ```bash
 python manage.py run_strategy --symbol AAPL
 ```
 
 ```bash
-python manage.py run_strategy --all --backfill-days 5
-```
-
-```bash
 python manage.py run_strategy --strategy-id 1 --evaluate-only
 ```
 
-Schedule it with cron, for example every 15 minutes during US market hours on weekdays:
-
-```cron
-*/15 13-21 * * 1-5 cd /path/to/python-trading && .venv/bin/python manage.py run_strategy --all --backfill-days 5 >> strategy.log 2>&1
-```
+If you'd rather use cron than `run_scheduler`, schedule `run_strategy --all --backfill-days 5`.
+On **Strategies**, each row also has **Run** (evaluate now) and an **Auto** switch to turn a strategy on or off.
 
 ### Signal logic
 

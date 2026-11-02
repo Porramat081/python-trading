@@ -21,8 +21,8 @@
         data: {
           labels,
           datasets: [
-            { label: data.symbol + " close", data: data.close, borderColor: "#334155", borderWidth: 1.5, pointRadius: 0, tension: 0.1 },
-            { label: data.ma_type + " " + data.short_window, data: data.short_ma, borderColor: "#2563eb", borderWidth: 1.5, pointRadius: 0 },
+            { label: data.symbol + " close", data: data.close, borderColor: "#9ca3af", borderWidth: 1.5, pointRadius: 0, tension: 0.1 },
+            { label: data.ma_type + " " + data.short_window, data: data.short_ma, borderColor: "#4f46e5", borderWidth: 1.5, pointRadius: 0 },
             { label: data.ma_type + " " + data.long_window, data: data.long_ma, borderColor: "#f59e0b", borderWidth: 1.5, pointRadius: 0 },
             { label: "BUY signal", data: buys, showLine: false, pointStyle: "triangle", pointRadius: 7, backgroundColor: "#16a34a", borderColor: "#16a34a" },
             { label: "SELL signal", data: sells, showLine: false, pointStyle: "triangle", rotation: 180, pointRadius: 7, backgroundColor: "#dc2626", borderColor: "#dc2626" },
@@ -34,7 +34,7 @@
           interaction: { mode: "index", intersect: false },
           spanGaps: true,
           scales: { x: { ticks: { maxTicksLimit: 10 } }, y: { ticks: { callback: (v) => "$" + v } } },
-          plugins: { legend: { position: "bottom" } },
+          plugins: { legend: { position: "bottom", labels: { boxWidth: 10, usePointStyle: true } } },
         },
       });
     })

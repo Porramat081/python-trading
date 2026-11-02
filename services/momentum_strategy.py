@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 
 import pandas as pd
@@ -40,6 +40,8 @@ class StrategyResult:
             parts.append(f"close={self.close:.2f}")
         if self.short_ma is not None and self.long_ma is not None:
             parts.append(f"shortMA={self.short_ma:.2f} longMA={self.long_ma:.2f}")
+        if self.extra.get("trend"):
+            parts.append(f"trend={self.extra['trend']}")
         if self.trade_status:
             parts.append(f"trade={self.trade_status}")
         if self.message:
@@ -118,6 +120,9 @@ def chart_data(strategy, limit: int = 300) -> dict:
 
 
 # -- orchestration -----------------------------------------------------------
+UP, DOWN = "UP", "DOWN"
+
+
 class MomentumStrategy:
     """Evaluates a StrategyConfig and (optionally) sends orders via SnapTrade."""
 
@@ -151,14 +156,21 @@ class MomentumStrategy:
         result.close = float(last["close"])
         result.short_ma = float(last["short_ma"])
         result.long_ma = float(last["long_ma"])
+        result.extra["trend"] = UP if result.short_ma > result.long_ma else DOWN
         return result
+
+    def _record(self, result: StrategyResult) -> None:
+        cfg = self.config
+        cfg.last_run = timezone.now()
+        cfg.last_signal = result.signal
+        cfg.trend = result.extra.get("trend", "")
+        cfg.save(update_fields=["last_run", "last_signal", "trend", "last_signal_bar", "is_active"])
+        logger.info("%s", result)
 
     def run(self, execute: bool = True) -> StrategyResult:
         """Evaluate the strategy, record the run and trade on a fresh crossover."""
         cfg = self.config
         result = self.evaluate()
-        cfg.last_run = timezone.now()
-        cfg.last_signal = result.signal
 
         already_handled = (
             result.bar_time is not None
@@ -168,16 +180,55 @@ class MomentumStrategy:
         if result.signal in (BUY, SELL) and already_handled:
             result.message = "Signal for this candle was already handled."
         elif result.signal in (BUY, SELL) and execute:
-            self._trade(result)
+            self._trade(result, result.signal)
             cfg.last_signal_bar = result.bar_time
         elif result.signal in (BUY, SELL):
             result.message = "Evaluation only (no execution requested)."
 
-        cfg.save(update_fields=["last_run", "last_signal", "last_signal_bar"])
-        logger.info("%s", result)
+        self._record(result)
         return result
 
-    def _trade(self, result: StrategyResult) -> None:
+    def start(self, backfill_days: int | None = None) -> StrategyResult:
+        """Automatic setup for a newly created strategy.
+
+        1. Backfill price history for the symbol.
+        2. Evaluate the signal and current trend.
+        3. Switch the strategy ON so the scheduler keeps running it.
+        4. Trend-based entry: if the latest signal is BUY, or the short MA is above the
+           long MA (uptrend) and the signal is not SELL, buy now. Otherwise wait for the
+           next BUY crossover.
+        """
+        from services.massive_service import MassiveAPIError, fetch_historical_data
+
+        cfg = self.config
+        days = backfill_days or max(730, cfg.long_window * 4)
+        end = timezone.now().date()
+        backfill_note = ""
+        try:
+            summary = fetch_historical_data(cfg.symbol, end - timedelta(days=days), end)
+            backfill_note = f"Backfilled {summary['created']} new candles. "
+        except MassiveAPIError as exc:
+            backfill_note = f"Backfill failed ({exc}). "
+            logger.warning("Backfill for %s failed: %s", cfg.symbol, exc)
+
+        result = self.evaluate()
+        cfg.is_active = True
+        trend = result.extra.get("trend")
+
+        if result.bar_time is None:
+            result.message = backfill_note + result.message + " Strategy is ON and will retry on schedule."
+        elif result.signal == SELL or (result.signal == HOLD and trend == DOWN):
+            result.message = backfill_note + "Downtrend: no entry. Strategy is ON, waiting for the next BUY crossover."
+            cfg.last_signal_bar = result.bar_time
+        else:
+            self._trade(result, BUY, entry=True)
+            cfg.last_signal_bar = result.bar_time
+            result.message = backfill_note + "Entry: " + (result.message or "")
+
+        self._record(result)
+        return result
+
+    def _trade(self, result: StrategyResult, action: str, entry: bool = False) -> None:
         from django.conf import settings
 
         from services.snaptrade_service import SnapTradeServiceError, TradingDisabledError
@@ -186,7 +237,7 @@ class MomentumStrategy:
         cfg = self.config
         account = cfg.account
         if account is None or not account.is_linked:
-            result.message = "Signal fired but no linked brokerage account is configured."
+            result.message = f"{action} signal, but no linked brokerage account is set on this strategy."
             return
 
         quantity = Decimal(cfg.trade_quantity)
@@ -194,36 +245,34 @@ class MomentumStrategy:
             account=account,
             strategy=cfg,
             symbol=cfg.symbol,
-            action=result.signal,
+            action=action,
             quantity=quantity,
             price=Decimal(str(round(result.close, 4))) if result.close is not None else None,
             status=TradeLog.Status.PENDING,
         )
         result.trade_log_id = log.id
 
+        def finish(status, message):
+            log.status, log.message = status, message[:2000]
+            log.save()
+            result.trade_status, result.message = log.status, log.message
+
         if not settings.TRADING_ENABLED:
-            log.status = TradeLog.Status.SKIPPED
-            log.message = "Dry run: TRADING_ENABLED is False."
-            log.save(update_fields=["status", "message"])
-            result.trade_status = log.status
-            result.message = log.message
-            return
+            return finish(TradeLog.Status.SKIPPED, "Dry run: TRADING_ENABLED is False.")
 
         try:
-            if result.signal == SELL:
+            if action == SELL or entry:
                 held = self.service.get_position_units(
                     account.snaptrade_user_id,
                     account.snaptrade_user_secret,
                     account.account_id,
                     cfg.symbol,
                 )
-                if held <= 0:
-                    log.status = TradeLog.Status.SKIPPED
-                    log.message = "SELL signal but no position held; not shorting."
-                    log.save(update_fields=["status", "message"])
-                    result.trade_status, result.message = log.status, log.message
-                    return
-                if held < float(quantity):
+                if entry and held > 0:
+                    return finish(TradeLog.Status.SKIPPED, f"Already holding {held:g} {cfg.symbol}; no entry buy.")
+                if action == SELL and held <= 0:
+                    return finish(TradeLog.Status.SKIPPED, "SELL signal but no position held; not shorting.")
+                if action == SELL and held < float(quantity):
                     quantity = Decimal(str(held))
                     log.quantity = quantity
 
@@ -232,28 +281,51 @@ class MomentumStrategy:
                 user_secret=account.snaptrade_user_secret,
                 account_id=account.account_id,
                 symbol=cfg.symbol,
-                side=result.signal,
+                side=action,
                 units=quantity,
                 order_type="Market",
                 is_paper=account.is_paper,
             )
-            log.status = TradeLog.Status.EXECUTED
             log.order_id = order["order_id"]
             if order.get("price"):
                 log.price = Decimal(str(order["price"]))
-            log.message = f"Broker status: {order.get('status') or 'submitted'}"
+            finish(TradeLog.Status.EXECUTED, f"Broker status: {order.get('status') or 'submitted'}")
         except TradingDisabledError as exc:
-            log.status = TradeLog.Status.SKIPPED
-            log.message = str(exc)
+            finish(TradeLog.Status.SKIPPED, str(exc))
         except SnapTradeServiceError as exc:
-            log.status = TradeLog.Status.FAILED
-            log.message = str(exc)[:2000]
             logger.error("Order failed for %s: %s", cfg, exc)
-
-        log.save()
-        result.trade_status = log.status
-        result.message = log.message
+            finish(TradeLog.Status.FAILED, str(exc))
 
 
 def run_strategy(config, execute: bool = True) -> StrategyResult:
     return MomentumStrategy(config).run(execute=execute)
+
+
+def start_strategy(config, snaptrade_service=None) -> StrategyResult:
+    """Backfill, evaluate, switch ON and (trend permitting) enter a new strategy."""
+    return MomentumStrategy(config, snaptrade_service=snaptrade_service).start()
+
+
+def refresh_and_run_active(backfill_days: int = 7, execute: bool = True, log=print) -> list[StrategyResult]:
+    """Refresh recent candles for every active symbol and run all active strategies."""
+    from services.massive_service import MassiveAPIError, fetch_historical_data
+    from trading.models import StrategyConfig
+
+    strategies = list(StrategyConfig.objects.filter(is_active=True).select_related("account"))
+    end = timezone.now().date()
+    for symbol in sorted({s.symbol for s in strategies}):
+        try:
+            fetch_historical_data(symbol, end - timedelta(days=backfill_days), end)
+        except MassiveAPIError as exc:
+            log(f"Backfill {symbol} failed: {exc}")
+    results = []
+    for strategy in strategies:
+        try:
+            result = run_strategy(strategy, execute=execute)
+        except Exception as exc:  # keep going with other strategies
+            logger.exception("Strategy %s failed", strategy)
+            log(f"[{strategy.name}] error: {exc}")
+            continue
+        log(str(result))
+        results.append(result)
+    return results

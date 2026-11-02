@@ -1,6 +1,4 @@
 import logging
-from datetime import date, timedelta
-
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -10,11 +8,10 @@ from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from services.massive_service import MassiveAPIError, fetch_historical_data
-from services.momentum_strategy import chart_data, run_strategy
+from services.momentum_strategy import chart_data, run_strategy, start_strategy
 from services.snaptrade_service import SnapTradeService, SnapTradeServiceError
 
-from .forms import BackfillForm, StrategyConfigForm
+from .forms import StrategyConfigForm, linked_accounts
 from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
 
 logger = logging.getLogger(__name__)
@@ -61,7 +58,7 @@ def dashboard(request):
         "account_cards": account_cards,
         "has_pending_registration": any(not a.is_linked for a in accounts),
         "total_value": total_value,
-        "recent_trades": TradeLog.objects.filter(account__in=accounts).select_related("account", "strategy")[:15],
+        "recent_trades": TradeLog.objects.filter(account__in=accounts).select_related("account", "strategy")[:10],
         "strategies": strategies,
         "selected_strategy": selected,
         "candle_count": StockData.objects.filter(symbol=selected.symbol).count() if selected else 0,
@@ -84,7 +81,8 @@ def positions(request):
             except SnapTradeServiceError as exc:
                 entry["error"] = str(exc)
         rows.append(entry)
-    return render(request, "trading/positions.html", {"rows": rows})
+    has_positions = any(r["positions"] for r in rows)
+    return render(request, "trading/positions.html", {"rows": rows, "has_positions": has_positions})
 
 
 # -- strategies -------------------------------------------------------------
@@ -94,15 +92,22 @@ def strategies(request):
         form = StrategyConfigForm(request.POST, user=request.user)
         if form.is_valid():
             strategy = form.save()
-            messages.success(request, f"Strategy '{strategy.name}' created.")
+            # Automatic setup: backfill -> evaluate -> switch ON -> trend-based entry.
+            try:
+                result = start_strategy(strategy)
+                level = messages.ERROR if result.trade_status == "FAILED" else messages.SUCCESS
+                messages.add_message(request, level, f"{strategy.symbol}: {result.signal} · {result.message}")
+            except Exception as exc:
+                logger.exception("Strategy start failed")
+                messages.error(request, f"{strategy.symbol} created, but automatic start failed: {exc}")
             return redirect("trading:strategies")
     else:
         form = StrategyConfigForm(user=request.user, initial={"short_window": 10, "long_window": 50})
-    items = StrategyConfig.objects.select_related("account").order_by("name")
+    items = StrategyConfig.objects.select_related("account").order_by("symbol", "name")
     return render(
         request,
         "trading/strategies.html",
-        {"strategies": items, "form": form, "backfill_form": BackfillForm()},
+        {"strategies": items, "form": form, "multi_account": linked_accounts(request.user).count() > 1},
     )
 
 
@@ -141,31 +146,13 @@ def strategy_delete(request, pk):
 @require_POST
 def strategy_run(request, pk):
     strategy = get_object_or_404(StrategyConfig.objects.select_related("account"), pk=pk)
-    execute = request.POST.get("execute") == "1"
     try:
-        result = run_strategy(strategy, execute=execute)
+        result = run_strategy(strategy, execute=True)
         level = messages.ERROR if result.trade_status == "FAILED" else messages.SUCCESS
         messages.add_message(request, level, str(result))
     except Exception as exc:
         logger.exception("Strategy run failed")
         messages.error(request, f"Run failed: {exc}")
-    return redirect(request.POST.get("next") or "trading:strategies")
-
-
-@login_required
-@require_POST
-def strategy_backfill(request, pk):
-    strategy = get_object_or_404(StrategyConfig, pk=pk)
-    form = BackfillForm(request.POST)
-    days = form.cleaned_data["days"] if form.is_valid() else 365
-    end = date.today()
-    try:
-        s = fetch_historical_data(strategy.symbol, end - timedelta(days=days), end)
-        messages.success(
-            request, f"{s['symbol']}: fetched {s['fetched']}, created {s['created']}, skipped {s['skipped']}."
-        )
-    except MassiveAPIError as exc:
-        messages.error(request, f"Backfill failed: {exc}")
     return redirect(request.POST.get("next") or "trading:strategies")
 
 

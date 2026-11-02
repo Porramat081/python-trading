@@ -1,60 +1,53 @@
 {% extends "trading/base.html" %}
 {% block title %}Strategies · Algo Trader{% endblock %}
 {% block content %}
-<div class="page-head"><h1>Strategy control panel</h1></div>
-{% if not TRADING_ENABLED %}
-  <p class="notice">Dry-run mode: signals are evaluated and logged, but no orders are sent. Set <code>TRADING_ENABLED=True</code> in <code>.env</code> to place orders.</p>
-{% endif %}
+<h1>Strategies</h1>
 
-<section class="card">
-  <div class="table-wrap">
-  <table>
-    <thead><tr><th>Name</th><th>Symbol</th><th>MA</th><th class="num">Short</th><th class="num">Long</th><th>Account</th><th class="num">Qty</th><th>Last signal</th><th>Last run</th><th>Auto</th><th></th></tr></thead>
-    <tbody>
-    {% for s in strategies %}
-      <tr>
-        <td><strong>{{ s.name }}</strong></td>
-        <td>{{ s.symbol }}</td>
-        <td>{{ s.ma_type }}</td>
-        <td class="num">{{ s.short_window }}</td>
-        <td class="num">{{ s.long_window }}</td>
-        <td class="small">{% if s.account %}{{ s.account.account_name|default:s.account.account_id }}{% else %}—{% endif %}</td>
-        <td class="num">{{ s.trade_quantity|floatformat:"-4" }}</td>
-        <td>{% if s.last_signal %}<span class="side side-{{ s.last_signal|lower }}">{{ s.last_signal }}</span>{% else %}—{% endif %}</td>
-        <td class="small">{{ s.last_run|date:"Y-m-d H:i"|default:"never" }}</td>
-        <td>
-          <form method="post" action="{% url 'trading:strategy_toggle' s.pk %}" class="inline">{% csrf_token %}
-            <button class="toggle {% if s.is_active %}on{% endif %}" title="Toggle automated execution">{% if s.is_active %}ON{% else %}OFF{% endif %}</button>
-          </form>
-        </td>
-        <td class="actions-cell">
-          <a class="btn btn-sm" href="{% url 'trading:strategy_edit' s.pk %}">Edit</a>
-          <a class="btn btn-sm" href="{% url 'trading:dashboard' %}?strategy={{ s.pk }}">Chart</a>
-          <form method="post" action="{% url 'trading:strategy_backfill' s.pk %}" class="inline">{% csrf_token %}
-            <input type="hidden" name="days" value="365"><button class="btn btn-sm">Backfill</button>
-          </form>
-          <form method="post" action="{% url 'trading:strategy_run' s.pk %}" class="inline">{% csrf_token %}
-            <button class="btn btn-sm">Evaluate</button>
-          </form>
-          <form method="post" action="{% url 'trading:strategy_run' s.pk %}" class="inline"
-                onsubmit="return confirm('Evaluate and place an order if a new crossover signal fires?');">{% csrf_token %}
-            <input type="hidden" name="execute" value="1"><button class="btn btn-sm btn-primary">Run &amp; trade</button>
-          </form>
-        </td>
-      </tr>
-    {% empty %}
-      <tr><td colspan="11" class="muted">No strategies yet. Add one below.</td></tr>
-    {% endfor %}
-    </tbody>
-  </table>
-  </div>
-</section>
+<form method="post" class="add">{% csrf_token %}
+  {{ form.symbol.errors }}<input name="symbol" placeholder="Symbol" value="{{ form.symbol.value|default:'' }}" required autocomplete="off">
+  <input name="trade_quantity" type="number" step="any" min="0" placeholder="Qty" value="{{ form.trade_quantity.value|default:1 }}" required title="Units per order">
+  {% if multi_account %}{{ form.account }}{% elif form.account.value %}<input type="hidden" name="account" value="{{ form.account.value }}">{% endif %}
+  <button class="btn dark">Add &amp; start</button>
+  <span class="muted small">Fetches data, evaluates, turns it on, and buys if the trend is up.</span>
+  {{ form.trade_quantity.errors }}{{ form.short_window.errors }}{{ form.non_field_errors }}
+  <details {% if form.errors %}open{% endif %}>
+    <summary>Advanced</summary>
+    <div class="adv">
+      {{ form.ma_type }}
+      <label class="small muted">Short {{ form.short_window }}</label>
+      <label class="small muted">Long {{ form.long_window }}</label>
+      <input name="name" placeholder="Name (optional)" value="{{ form.name.value|default:'' }}">
+    </div>
+  </details>
+</form>
 
-<section class="card narrow-form">
-  <h2>New strategy</h2>
-  <form method="post">{% csrf_token %}
-    {{ form.as_p }}
-    <button class="btn btn-primary">Create strategy</button>
-  </form>
-</section>
+<div class="scroll">
+<table>
+  <thead><tr><th>Symbol</th><th>Rule</th><th>Trend</th><th>Signal</th><th class="num">Qty</th>{% if multi_account %}<th>Account</th>{% endif %}<th>Checked</th><th>Auto</th><th></th></tr></thead>
+  <tbody>
+  {% for s in strategies %}
+    <tr>
+      <td><a href="{% url 'trading:dashboard' %}?strategy={{ s.pk }}"><strong>{{ s.symbol }}</strong></a>{% if not s.account %} <span class="err small" title="Orders need a linked account">no account</span>{% endif %}</td>
+      <td class="muted">{{ s.ma_type }} {{ s.short_window }}/{{ s.long_window }}</td>
+      <td>{% if s.trend == 'UP' %}<span class="up">▲ up</span>{% elif s.trend == 'DOWN' %}<span class="down">▼ down</span>{% else %}<span class="muted">—</span>{% endif %}</td>
+      <td class="{% if s.last_signal == 'BUY' %}up{% elif s.last_signal == 'SELL' %}down{% else %}muted{% endif %}">{{ s.last_signal|default:"—" }}</td>
+      <td class="num">{{ s.trade_quantity|floatformat:"-4" }}</td>
+      {% if multi_account %}<td class="muted">{{ s.account.account_name|default:"—" }}</td>{% endif %}
+      <td class="muted">{% if s.last_run %}{{ s.last_run|timesince }} ago{% else %}never{% endif %}</td>
+      <td>
+        <form method="post" action="{% url 'trading:strategy_toggle' s.pk %}" class="inline">{% csrf_token %}
+          <button class="switch {% if s.is_active %}on{% endif %}" title="Automatic trading {% if s.is_active %}ON{% else %}OFF{% endif %}" aria-label="Toggle"></button>
+        </form>
+      </td>
+      <td class="num">
+        <form method="post" action="{% url 'trading:strategy_run' s.pk %}" class="inline">{% csrf_token %}<button class="quiet" title="Evaluate now and trade on a new crossover">Run</button></form>
+        &nbsp;<a class="quiet" href="{% url 'trading:strategy_edit' s.pk %}">Edit</a>
+      </td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="9" class="muted">No strategies yet. Try SPY, AAPL or MSFT.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
 {% endblock %}

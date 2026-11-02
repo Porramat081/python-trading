@@ -270,6 +270,7 @@ class ViewTests(TestCase):
             "name": "Good", "symbol": "tsla", "ma_type": "EMA", "short_window": 5, "long_window": 20,
             "trade_quantity": "1",
         })
+        self.assertTrue(StrategyConfig.objects.get(name="Good").is_active)
         self.assertTrue(StrategyConfig.objects.filter(name="Good", symbol="TSLA").exists())
 
     def test_admin_pages(self):
@@ -279,3 +280,127 @@ class ViewTests(TestCase):
                     "admin:trading_strategyconfig_changelist", "admin:trading_tradelog_changelist",
                     "admin:trading_brokerageaccount_changelist"):
             self.assertEqual(self.client.get(reverse(url)).status_code, 200, url)
+
+
+# Steady uptrend (short MA above long MA, no fresh crossover on the last bar) and the mirror.
+UPTREND = [100 + i for i in range(40)]
+DOWNTREND = [200 - i for i in range(40)]
+
+
+class AutoStartTests(TestCase):
+    """Creating a strategy: backfill -> evaluate -> switch ON -> trend-based entry."""
+
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("trader", password="pw-123456")
+        self.account = BrokerageAccount.objects.create(
+            user=self.user, snaptrade_user_id="u1", snaptrade_user_secret="s1", account_id="acc-1", is_paper=True,
+        )
+        self.backfill = mock.patch(
+            "services.massive_service.fetch_historical_data",
+            return_value={"symbol": "AAPL", "fetched": 0, "created": 0, "skipped": 0},
+        )
+        self.backfill_mock = self.backfill.start()
+        self.addCleanup(self.backfill.stop)
+
+    def make(self, closes, **kw):
+        make_candles("AAPL", closes)
+        return StrategyConfig.objects.create(
+            name="A", symbol="AAPL", short_window=3, long_window=10, account=self.account, **kw
+        )
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_uptrend_buys_and_turns_on(self):
+        strategy = self.make(UPTREND)
+        service = FakeService()
+        result = ms.start_strategy(strategy, snaptrade_service=service)
+        self.backfill_mock.assert_called_once()
+        strategy.refresh_from_db()
+        self.assertTrue(strategy.is_active)
+        self.assertEqual((strategy.trend, result.signal), ("UP", "HOLD"))
+        self.assertEqual(service.orders[0]["side"], "BUY")
+        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.EXECUTED)
+        # The scheduler's next run on the same candle must not buy again.
+        ms.MomentumStrategy(strategy, snaptrade_service=service).run()
+        self.assertEqual(len(service.orders), 1)
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_downtrend_and_sell_do_not_buy(self):
+        for closes in (DOWNTREND, CROSS_DOWN):
+            StockData.objects.all().delete()
+            strategy = self.make(closes)
+            service = FakeService()
+            ms.start_strategy(strategy, snaptrade_service=service)
+            strategy.refresh_from_db()
+            self.assertTrue(strategy.is_active)
+            self.assertEqual(service.orders, [])
+        self.assertFalse(TradeLog.objects.exists())
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_entry_skipped_when_already_holding(self):
+        strategy = self.make(UPTREND)
+        service = FakeService(held=5)
+        ms.start_strategy(strategy, snaptrade_service=service)
+        self.assertEqual(service.orders, [])
+        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.SKIPPED)
+
+    @override_settings(TRADING_ENABLED=False)
+    def test_dry_run_entry_logged_as_skipped(self):
+        strategy = self.make(CROSS_UP)
+        ms.start_strategy(strategy, snaptrade_service=FakeService())
+        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.SKIPPED)
+
+    def test_no_data_still_turns_on(self):
+        strategy = self.make([])
+        result = ms.start_strategy(strategy, snaptrade_service=FakeService())
+        strategy.refresh_from_db()
+        self.assertTrue(strategy.is_active)
+        self.assertIn("Not enough data", result.message)
+
+    @override_settings(TRADING_ENABLED=False)
+    def test_create_via_web_form_auto_starts(self):
+        make_candles("AAPL", UPTREND)
+        self.client.force_login(self.user)
+        response = self.client.post(reverse("trading:strategies"), {
+            "symbol": "aapl", "trade_quantity": "2", "account": self.account.pk,
+            "ma_type": "SMA", "short_window": 3, "long_window": 10, "name": "",
+        }, follow=True)
+        strategy = StrategyConfig.objects.get()
+        self.assertEqual(strategy.name, "AAPL SMA 3/10")
+        self.assertTrue(strategy.is_active)
+        self.assertEqual(strategy.trend, "UP")
+        self.assertContains(response, "Dry run")
+        self.assertEqual(TradeLog.objects.get().action, "BUY")
+
+    @override_settings(TRADING_ENABLED=False)
+    def test_scheduler_once_runs_active_strategies(self):
+        self.make(CROSS_UP, is_active=True)
+        StrategyConfig.objects.create(name="off", symbol="MSFT", short_window=3, long_window=10)
+        out = StringIO()
+        call_command("run_scheduler", "--once", stdout=out)
+        self.assertIn("AAPL: BUY", out.getvalue())
+        self.assertNotIn("MSFT", out.getvalue())
+
+    def test_market_hours(self):
+        from zoneinfo import ZoneInfo
+
+        from trading.management.commands.run_scheduler import market_is_open
+
+        ny = ZoneInfo("America/New_York")
+        self.assertTrue(market_is_open(datetime(2026, 11, 2, 10, 0, tzinfo=ny)))   # Monday
+        self.assertFalse(market_is_open(datetime(2026, 11, 2, 16, 30, tzinfo=ny)))
+        self.assertFalse(market_is_open(datetime(2026, 11, 7, 11, 0, tzinfo=ny)))  # Saturday
+
+
+class BackfillRefreshTests(TestCase):
+    def test_latest_existing_candle_is_refreshed(self):
+        ts = START
+        client = mock.Mock(get_aggregates=mock.Mock(return_value=[
+            Candle("AAPL", ts, Decimal("1"), Decimal("2"), Decimal("1"), Decimal("1.5"), 10)
+        ]))
+        fetch_historical_data("AAPL", "2025-01-01", "2025-01-01", client=client)
+        client.get_aggregates.return_value = [
+            Candle("AAPL", ts, Decimal("1"), Decimal("3"), Decimal("1"), Decimal("2.5"), 99)
+        ]
+        fetch_historical_data("AAPL", "2025-01-01", "2025-01-01", client=client)
+        row = StockData.objects.get()
+        self.assertEqual((row.close_price, row.volume), (Decimal("2.5"), 99))

@@ -144,7 +144,8 @@ def fetch_historical_data(
     multiplier: int = 1,
     client: MassiveClient | None = None,
 ) -> dict:
-    """Backfill candles for `symbol` into StockData, skipping rows that already exist.
+    """Backfill candles for `symbol` into StockData, skipping rows that already exist
+    (the most recent existing candle is refreshed, in case it was a partial bar).
 
     Returns a summary dict: {"symbol", "fetched", "created", "skipped"}.
     """
@@ -165,7 +166,7 @@ def fetch_historical_data(
             timestamp__lte=candles[-1].timestamp,
         ).values_list("timestamp", flat=True)
     )
-    new_rows = [
+    rows = [
         StockData(
             symbol=c.symbol,
             timestamp=c.timestamp,
@@ -176,10 +177,16 @@ def fetch_historical_data(
             volume=c.volume,
         )
         for c in candles
-        if c.timestamp not in existing
     ]
-    # ignore_conflicts guards against races with a concurrent backfill.
+    new_rows = [r for r in rows if r.timestamp not in existing]
     StockData.objects.bulk_create(new_rows, batch_size=1000, ignore_conflicts=True)
+    # Refresh the most recent stored candle: it may have been saved mid-session (partial bar).
+    latest = [r for r in rows if r.timestamp in existing][-1:]
+    for r in latest:
+        StockData.objects.filter(symbol=symbol, timestamp=r.timestamp).update(
+            open_price=r.open_price, high_price=r.high_price, low_price=r.low_price,
+            close_price=r.close_price, volume=r.volume,
+        )
     summary = {
         "symbol": symbol,
         "fetched": len(candles),

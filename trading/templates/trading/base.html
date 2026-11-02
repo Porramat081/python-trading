@@ -5,34 +5,30 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}Algo Trader{% endblock %}</title>
   <link rel="stylesheet" href="{% static 'trading/style.css' %}">
-  {% block head %}{% endblock %}
 </head>
 <body>
-<header class="topbar">
+<header class="bar">
   <a class="brand" href="{% url 'trading:dashboard' %}">Algo Trader</a>
   {% if user.is_authenticated %}
+  {% with n=request.resolver_match.url_name %}
   <nav>
-    <a href="{% url 'trading:dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}">Dashboard</a>
-    <a href="{% url 'trading:positions' %}" class="{% if request.resolver_match.url_name == 'positions' %}active{% endif %}">Positions</a>
-    <a href="{% url 'trading:strategies' %}" class="{% if 'strateg' in request.resolver_match.url_name %}active{% endif %}">Strategies</a>
-    {% if user.is_staff %}<a href="{% url 'admin:index' %}">Admin</a>{% endif %}
+    <a href="{% url 'trading:dashboard' %}" {% if n == 'dashboard' %}class="on"{% endif %}>Dashboard</a>
+    <a href="{% url 'trading:positions' %}" {% if n == 'positions' %}class="on"{% endif %}>Positions</a>
+    <a href="{% url 'trading:strategies' %}" {% if 'strateg' in n %}class="on"{% endif %}>Strategies</a>
   </nav>
-  <div class="right">
-    <span class="badge {% if TRADING_ENABLED %}{% if LIVE_TRADING %}badge-danger{% else %}badge-ok{% endif %}{% else %}badge-muted{% endif %}">
-      {% if not TRADING_ENABLED %}Dry run{% elif LIVE_TRADING %}LIVE trading{% else %}Paper trading{% endif %}
+  {% endwith %}
+  <div class="end">
+    <span class="mode {% if TRADING_ENABLED %}{% if LIVE_TRADING %}live{% else %}paper{% endif %}{% endif %}"
+          title="{% if not TRADING_ENABLED %}Orders are not sent (TRADING_ENABLED=False){% endif %}">
+      {% if not TRADING_ENABLED %}Dry run{% elif LIVE_TRADING %}Live{% else %}Paper{% endif %}
     </span>
-    <form method="post" action="{% url 'logout' %}" class="inline">{% csrf_token %}
-      <button class="link">Log out ({{ user.username }})</button>
-    </form>
+    {% if user.is_staff %}<a href="{% url 'admin:index' %}" class="quiet">Admin</a>{% endif %}
+    <form method="post" action="{% url 'logout' %}">{% csrf_token %}<button class="quiet">Log out</button></form>
   </div>
   {% endif %}
 </header>
-<main class="container">
-  {% if messages %}
-    <ul class="messages">
-      {% for message in messages %}<li class="msg msg-{{ message.tags }}">{{ message }}</li>{% endfor %}
-    </ul>
-  {% endif %}
+<main>
+  {% for message in messages %}<p class="flash {{ message.tags }}">{{ message }}</p>{% endfor %}
   {% block content %}{% endblock %}
 </main>
 {% block scripts %}{% endblock %}

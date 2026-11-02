@@ -1,105 +1,58 @@
 {% extends "trading/base.html" %}
 {% block title %}Dashboard · Algo Trader{% endblock %}
 {% block content %}
-<div class="page-head">
-  <h1>Dashboard</h1>
-  <div class="actions">
-    <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}
-      <button class="btn">Sync accounts</button>
-    </form>
+<div class="head">
+  <div>
+    <div class="muted small">Portfolio value</div>
+    <div class="total">${{ total_value|floatformat:2 }}</div>
+    <div class="accounts small">
+      {% for card in account_cards %}
+        <span>{{ card.account.account_name|default:"Alpaca" }} · {% if card.account.is_paper %}paper{% else %}live{% endif %}
+          {% if card.error %}<span class="err" title="{{ card.error }}">· unavailable</span>
+          {% elif card.balance %}· cash ${{ card.balance.cash|floatformat:2 }}{% endif %}</span>
+      {% empty %}
+        <span>{% if has_pending_registration %}Finish the SnapTrade connection, then sync.{% else %}No brokerage account linked.{% endif %}</span>
+      {% endfor %}
+    </div>
+  </div>
+  <div>
+    {% if account_cards or has_pending_registration %}
+    <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}<button class="btn">Sync</button></form>
+    {% endif %}
+    {% if not account_cards %}
     <form method="post" action="{% url 'trading:connect_brokerage' %}" class="inline">{% csrf_token %}
-      <button class="btn btn-primary">Connect Alpaca{% if not LIVE_TRADING %} (paper){% endif %}</button>
+      <button class="btn dark">Connect Alpaca{% if not LIVE_TRADING %} paper{% endif %}</button>
     </form>
+    {% endif %}
   </div>
 </div>
 
-<section class="grid">
-  <div class="card stat">
-    <div class="stat-label">Total portfolio value</div>
-    <div class="stat-value">${{ total_value|floatformat:2 }}</div>
-    <div class="muted">{{ account_cards|length }} linked account{{ account_cards|length|pluralize }}</div>
+<h2>Chart</h2>
+{% if strategies %}
+  <div class="tabs">
+    {% for s in strategies %}<a href="?strategy={{ s.pk }}" {% if s.pk == selected_strategy.pk %}class="on"{% endif %}>{{ s.symbol }}</a>{% endfor %}
   </div>
-  {% for card in account_cards %}
-  <div class="card">
-    <div class="row-between">
-      <strong>{{ card.account.brokerage_name }} · {{ card.account.account_name|default:card.account.account_id }}</strong>
-      {% if card.error %}<span class="badge badge-danger">Error</span>
-      {% else %}<span class="badge badge-ok">Connected</span>{% endif %}
-    </div>
-    <div class="muted">{% if card.account.is_paper %}Paper account{% else %}Live account{% endif %}</div>
-    {% if card.error %}
-      <p class="error small">{{ card.error }}</p>
-    {% elif card.balance %}
-      <dl class="kv">
-        <dt>Net value</dt><dd>{{ card.balance.net_value|floatformat:2 }} {{ card.balance.currency }}</dd>
-        <dt>Cash</dt><dd>{{ card.balance.cash|floatformat:2 }}</dd>
-        <dt>Buying power</dt><dd>{{ card.balance.buying_power|floatformat:2|default:"—" }}</dd>
-      </dl>
-    {% endif %}
-  </div>
-  {% empty %}
-  <div class="card">
-    <strong>No Alpaca account linked</strong>
-    <p class="muted">
-      {% if has_pending_registration %}You are registered with SnapTrade. Finish the connection, then click “Sync accounts”.
-      {% else %}Click “Connect Alpaca” to link your brokerage account through SnapTrade.{% endif %}
-    </p>
-  </div>
-  {% endfor %}
-</section>
+  <p class="muted small">
+    {{ selected_strategy.ma_type }} {{ selected_strategy.short_window }}/{{ selected_strategy.long_window }}
+    {% if selected_strategy.trend %}· trend <span class="{{ selected_strategy.trend|lower }}">{% if selected_strategy.trend == 'UP' %}▲ up{% else %}▼ down{% endif %}</span>{% endif %}
+    {% if selected_strategy.last_signal %}· signal {{ selected_strategy.last_signal }}{% endif %}
+    {% if selected_strategy.last_run %}· checked {{ selected_strategy.last_run|timesince }} ago{% endif %}
+  </p>
+  {% if candle_count %}<div class="chart"><canvas id="priceChart"></canvas></div>
+  {% else %}<p class="muted">No price data yet — it is fetched automatically on the next run.</p>{% endif %}
+{% else %}
+  <p class="muted">No strategies yet. <a href="{% url 'trading:strategies' %}">Add one</a>.</p>
+{% endif %}
 
-<section class="card">
-  <div class="row-between">
-    <h2>Price chart</h2>
-    {% if strategies %}
-    <form method="get" class="inline">
-      <select name="strategy" onchange="this.form.submit()">
-        {% for s in strategies %}
-          <option value="{{ s.pk }}" {% if s.pk == selected_strategy.pk %}selected{% endif %}>{{ s.name }} ({{ s.symbol }})</option>
-        {% endfor %}
-      </select>
-    </form>
-    {% endif %}
-  </div>
-  {% if selected_strategy %}
-    <p class="muted">
-      {{ selected_strategy.symbol }} · {{ selected_strategy.ma_type }} {{ selected_strategy.short_window }}/{{ selected_strategy.long_window }}
-      · {{ candle_count }} candles stored
-      · last signal: <strong>{{ selected_strategy.last_signal|default:"—" }}</strong>
-      {% if selected_strategy.last_run %}({{ selected_strategy.last_run|timesince }} ago){% endif %}
-    </p>
-    {% if candle_count %}
-      <div class="chart-wrap"><canvas id="priceChart"></canvas></div>
-    {% else %}
-      <p>No price data yet.</p>
-    {% endif %}
-    <div class="actions">
-      <form method="post" action="{% url 'trading:strategy_backfill' selected_strategy.pk %}" class="inline">{% csrf_token %}
-        <input type="hidden" name="days" value="365"><input type="hidden" name="next" value="{{ request.get_full_path }}">
-        <button class="btn">Backfill 1 year</button>
-      </form>
-      <form method="post" action="{% url 'trading:strategy_run' selected_strategy.pk %}" class="inline">{% csrf_token %}
-        <input type="hidden" name="next" value="{{ request.get_full_path }}">
-        <button class="btn">Evaluate signal</button>
-      </form>
-    </div>
-  {% else %}
-    <p>No strategies yet. <a href="{% url 'trading:strategies' %}">Create one</a>.</p>
-  {% endif %}
-</section>
-
-<section class="card">
-  <h2>Recent trades</h2>
-  {% include "trading/_trade_table.html" with trades=recent_trades %}
-</section>
+<h2>Recent trades</h2>
+{% include "trading/_trade_table.html" with trades=recent_trades %}
 {% endblock %}
 
 {% block scripts %}
 {% if selected_strategy and candle_count %}
+{% load static %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script>
-  window.CHART_URL = "{% url 'trading:strategy_chart' selected_strategy.pk %}";
-</script>
-{% load static %}<script src="{% static 'trading/chart.js' %}"></script>
+<script>window.CHART_URL = "{% url 'trading:strategy_chart' selected_strategy.pk %}";</script>
+<script src="{% static 'trading/chart.js' %}"></script>
 {% endif %}
 {% endblock %}

@@ -6,7 +6,7 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 
 from services.massive_service import MassiveAPIError, fetch_historical_data
-from services.momentum_strategy import run_strategy
+from services.momentum_strategy import run_strategy, start_strategy
 
 from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
 
@@ -101,13 +101,23 @@ class StockDataAdmin(admin.ModelAdmin):
 class StrategyConfigAdmin(admin.ModelAdmin):
     list_display = (
         "name", "symbol", "is_active", "ma_type", "short_window", "long_window",
-        "account", "trade_quantity", "last_signal", "last_run",
+        "account", "trade_quantity", "last_signal", "trend", "last_run",
     )
     list_filter = ("is_active", "ma_type", "symbol")
     list_editable = ("is_active",)
     search_fields = ("name", "symbol")
-    readonly_fields = ("last_run", "last_signal", "last_signal_bar")
+    readonly_fields = ("last_run", "last_signal", "trend", "last_signal_bar")
     actions = ["run_selected", "evaluate_selected", "backfill_selected", "activate", "deactivate"]
+
+    def save_model(self, request, obj, form, change):
+        super().save_model(request, obj, form, change)
+        if not change:
+            # Same automatic setup as the web UI: backfill, evaluate, switch ON, trend entry.
+            try:
+                result = start_strategy(obj)
+                self.message_user(request, f"Auto-start: {result}")
+            except Exception as exc:
+                self.message_user(request, f"Auto-start failed: {exc}", messages.ERROR)
 
     @admin.action(description="Run strategy evaluation (place orders on signals)")
     def run_selected(self, request, queryset):
