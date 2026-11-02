@@ -1,0 +1,40 @@
+{% load static %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Algo Trader{% endblock %}</title>
+  <link rel="stylesheet" href="{% static 'trading/style.css' %}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="{% url 'trading:dashboard' %}">Algo Trader</a>
+  {% if user.is_authenticated %}
+  <nav>
+    <a href="{% url 'trading:dashboard' %}" class="{% if request.resolver_match.url_name == 'dashboard' %}active{% endif %}">Dashboard</a>
+    <a href="{% url 'trading:positions' %}" class="{% if request.resolver_match.url_name == 'positions' %}active{% endif %}">Positions</a>
+    <a href="{% url 'trading:strategies' %}" class="{% if 'strateg' in request.resolver_match.url_name %}active{% endif %}">Strategies</a>
+    {% if user.is_staff %}<a href="{% url 'admin:index' %}">Admin</a>{% endif %}
+  </nav>
+  <div class="right">
+    <span class="badge {% if TRADING_ENABLED %}{% if LIVE_TRADING %}badge-danger{% else %}badge-ok{% endif %}{% else %}badge-muted{% endif %}">
+      {% if not TRADING_ENABLED %}Dry run{% elif LIVE_TRADING %}LIVE trading{% else %}Paper trading{% endif %}
+    </span>
+    <form method="post" action="{% url 'logout' %}" class="inline">{% csrf_token %}
+      <button class="link">Log out ({{ user.username }})</button>
+    </form>
+  </div>
+  {% endif %}
+</header>
+<main class="container">
+  {% if messages %}
+    <ul class="messages">
+      {% for message in messages %}<li class="msg msg-{{ message.tags }}">{{ message }}</li>{% endfor %}
+    </ul>
+  {% endif %}
+  {% block content %}{% endblock %}
+</main>
+{% block scripts %}{% endblock %}
+</body>
+</html>

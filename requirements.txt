@@ -1,0 +1,5 @@
+Django>=5.0,<7.0
+requests>=2.31
+snaptrade-python-sdk>=11.0
+python-dotenv>=1.0
+pandas>=2.1

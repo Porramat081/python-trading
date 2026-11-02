@@ -1,0 +1,60 @@
+{% extends "trading/base.html" %}
+{% block title %}Strategies · Algo Trader{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Strategy control panel</h1></div>
+{% if not TRADING_ENABLED %}
+  <p class="notice">Dry-run mode: signals are evaluated and logged, but no orders are sent. Set <code>TRADING_ENABLED=True</code> in <code>.env</code> to place orders.</p>
+{% endif %}
+
+<section class="card">
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Name</th><th>Symbol</th><th>MA</th><th class="num">Short</th><th class="num">Long</th><th>Account</th><th class="num">Qty</th><th>Last signal</th><th>Last run</th><th>Auto</th><th></th></tr></thead>
+    <tbody>
+    {% for s in strategies %}
+      <tr>
+        <td><strong>{{ s.name }}</strong></td>
+        <td>{{ s.symbol }}</td>
+        <td>{{ s.ma_type }}</td>
+        <td class="num">{{ s.short_window }}</td>
+        <td class="num">{{ s.long_window }}</td>
+        <td class="small">{% if s.account %}{{ s.account.account_name|default:s.account.account_id }}{% else %}—{% endif %}</td>
+        <td class="num">{{ s.trade_quantity|floatformat:"-4" }}</td>
+        <td>{% if s.last_signal %}<span class="side side-{{ s.last_signal|lower }}">{{ s.last_signal }}</span>{% else %}—{% endif %}</td>
+        <td class="small">{{ s.last_run|date:"Y-m-d H:i"|default:"never" }}</td>
+        <td>
+          <form method="post" action="{% url 'trading:strategy_toggle' s.pk %}" class="inline">{% csrf_token %}
+            <button class="toggle {% if s.is_active %}on{% endif %}" title="Toggle automated execution">{% if s.is_active %}ON{% else %}OFF{% endif %}</button>
+          </form>
+        </td>
+        <td class="actions-cell">
+          <a class="btn btn-sm" href="{% url 'trading:strategy_edit' s.pk %}">Edit</a>
+          <a class="btn btn-sm" href="{% url 'trading:dashboard' %}?strategy={{ s.pk }}">Chart</a>
+          <form method="post" action="{% url 'trading:strategy_backfill' s.pk %}" class="inline">{% csrf_token %}
+            <input type="hidden" name="days" value="365"><button class="btn btn-sm">Backfill</button>
+          </form>
+          <form method="post" action="{% url 'trading:strategy_run' s.pk %}" class="inline">{% csrf_token %}
+            <button class="btn btn-sm">Evaluate</button>
+          </form>
+          <form method="post" action="{% url 'trading:strategy_run' s.pk %}" class="inline"
+                onsubmit="return confirm('Evaluate and place an order if a new crossover signal fires?');">{% csrf_token %}
+            <input type="hidden" name="execute" value="1"><button class="btn btn-sm btn-primary">Run &amp; trade</button>
+          </form>
+        </td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="11" class="muted">No strategies yet. Add one below.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+</section>
+
+<section class="card narrow-form">
+  <h2>New strategy</h2>
+  <form method="post">{% csrf_token %}
+    {{ form.as_p }}
+    <button class="btn btn-primary">Create strategy</button>
+  </form>
+</section>
+{% endblock %}

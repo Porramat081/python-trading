@@ -1,0 +1,22 @@
+{% extends "admin/base_site.html" %}
+{% block breadcrumbs %}
+<div class="breadcrumbs">
+  <a href="{% url 'admin:index' %}">Home</a> &rsaquo;
+  <a href="{% url 'admin:trading_stockdata_changelist' %}">{{ opts.verbose_name_plural|capfirst }}</a> &rsaquo; Backfill
+</div>
+{% endblock %}
+{% block content %}
+<h1>{{ title }}</h1>
+<p>Fetches OHLCV candles from the Massive API. Rows already stored are skipped.</p>
+<form method="post">{% csrf_token %}
+  <fieldset class="module aligned">
+    {% for field in form %}
+      <div class="form-row">
+        {{ field.errors }}{{ field.label_tag }} {{ field }}
+        {% if field.help_text %}<div class="help">{{ field.help_text }}</div>{% endif %}
+      </div>
+    {% endfor %}
+  </fieldset>
+  <div class="submit-row"><input type="submit" class="default" value="Run backfill"></div>
+</form>
+{% endblock %}

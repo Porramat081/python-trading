@@ -1,0 +1,36 @@
+{% extends "trading/base.html" %}
+{% block title %}Positions · Algo Trader{% endblock %}
+{% block content %}
+<div class="page-head"><h1>Open positions</h1></div>
+{% for row in rows %}
+<section class="card">
+  <h2>{{ row.account.brokerage_name }} · {{ row.account.account_name|default:row.account.account_id }}
+    <span class="badge {% if row.account.is_paper %}badge-muted{% else %}badge-danger{% endif %}">{% if row.account.is_paper %}Paper{% else %}Live{% endif %}</span></h2>
+  {% if row.error %}
+    <p class="error">{{ row.error }}</p>
+  {% else %}
+  <div class="table-wrap">
+  <table>
+    <thead><tr><th>Symbol</th><th>Description</th><th class="num">Units</th><th class="num">Price</th><th class="num">Market value</th><th class="num">Cost basis</th></tr></thead>
+    <tbody>
+    {% for p in row.positions %}
+      <tr>
+        <td><strong>{{ p.symbol }}</strong></td>
+        <td class="small">{{ p.description }}</td>
+        <td class="num">{{ p.units|floatformat:"-4" }}</td>
+        <td class="num">{{ p.price|floatformat:2|default:"—" }}</td>
+        <td class="num">{{ p.market_value|floatformat:2|default:"—" }}</td>
+        <td class="num">{{ p.cost_basis|floatformat:2|default:"—" }}</td>
+      </tr>
+    {% empty %}
+      <tr><td colspan="6" class="muted">No open positions.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  </div>
+  {% endif %}
+</section>
+{% empty %}
+<section class="card"><p>No linked brokerage accounts. Go to the <a href="{% url 'trading:dashboard' %}">dashboard</a> to connect Alpaca.</p></section>
+{% endfor %}
+{% endblock %}
