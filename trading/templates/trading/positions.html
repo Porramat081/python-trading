@@ -1,7 +1,7 @@
 {% extends "trading/base.html" %}
 {% block title %}Positions · Algo Trader{% endblock %}
 {% block content %}
-<h1>Positions</h1>
+<h1>Positions · {{ MARKET }}</h1>
 {% for row in rows %}{% if row.error %}<p class="flash error">{{ row.account.account_name|default:row.account.account_id }}: {{ row.error }}</p>{% endif %}{% endfor %}
 {% if rows %}
 <div class="scroll">
@@ -23,6 +23,6 @@
 </table>
 </div>
 {% else %}
-<p class="muted">No linked brokerage account. <a href="{% url 'trading:dashboard' %}">Connect Alpaca</a> on the dashboard.</p>
+<p class="muted">No linked {{ MARKET }} brokerage account. <a href="{% url 'trading:settings' %}">Add one in Settings</a>.</p>
 {% endif %}
 {% endblock %}

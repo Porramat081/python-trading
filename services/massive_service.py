@@ -17,7 +17,10 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
-class MassiveAPIError(Exception):
+from services.errors import MarketDataError
+
+
+class MassiveAPIError(MarketDataError):
     """Raised when the Massive API returns an error or cannot be reached."""
 
 
@@ -144,54 +147,14 @@ def fetch_historical_data(
     multiplier: int = 1,
     client: MassiveClient | None = None,
 ) -> dict:
-    """Backfill candles for `symbol` into StockData, skipping rows that already exist
-    (the most recent existing candle is refreshed, in case it was a partial bar).
+    """Backfill US candles for `symbol` from Massive into StockData.
 
     Returns a summary dict: {"symbol", "fetched", "created", "skipped"}.
     """
-    from trading.models import StockData
+    from services.market_data import store_candles
 
     client = client or MassiveClient()
     candles = client.get_aggregates(
         symbol, start_date, end_date, multiplier=multiplier, timespan=timespan
     )
-    symbol = symbol.upper()
-    if not candles:
-        return {"symbol": symbol, "fetched": 0, "created": 0, "skipped": 0}
-
-    existing = set(
-        StockData.objects.filter(
-            symbol=symbol,
-            timestamp__gte=candles[0].timestamp,
-            timestamp__lte=candles[-1].timestamp,
-        ).values_list("timestamp", flat=True)
-    )
-    rows = [
-        StockData(
-            symbol=c.symbol,
-            timestamp=c.timestamp,
-            open_price=c.open,
-            high_price=c.high,
-            low_price=c.low,
-            close_price=c.close,
-            volume=c.volume,
-        )
-        for c in candles
-    ]
-    new_rows = [r for r in rows if r.timestamp not in existing]
-    StockData.objects.bulk_create(new_rows, batch_size=1000, ignore_conflicts=True)
-    # Refresh the most recent stored candle: it may have been saved mid-session (partial bar).
-    latest = [r for r in rows if r.timestamp in existing][-1:]
-    for r in latest:
-        StockData.objects.filter(symbol=symbol, timestamp=r.timestamp).update(
-            open_price=r.open_price, high_price=r.high_price, low_price=r.low_price,
-            close_price=r.close_price, volume=r.volume,
-        )
-    summary = {
-        "symbol": symbol,
-        "fetched": len(candles),
-        "created": len(new_rows),
-        "skipped": len(candles) - len(new_rows),
-    }
-    logger.info("Backfill %s: %s", symbol, summary)
-    return summary
+    return store_candles("US", symbol, candles)

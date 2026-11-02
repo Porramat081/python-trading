@@ -2,7 +2,9 @@ from datetime import date, timedelta
 
 from django.core.management.base import BaseCommand, CommandError
 
-from services.massive_service import MassiveAPIError, fetch_historical_data
+from services.errors import MarketDataError
+from services.market_data import backfill
+from services.massive_service import fetch_historical_data
 
 
 class Command(BaseCommand):
@@ -10,6 +12,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--symbol", required=True, nargs="+", help="One or more tickers.")
+        parser.add_argument("--market", choices=["US", "TH"], default="US", help="US (Massive) or TH (Settrade).")
         parser.add_argument("--days", type=int, default=365, help="Days back from today (default 365).")
         parser.add_argument("--start", type=date.fromisoformat, help="Start date YYYY-MM-DD.")
         parser.add_argument("--end", type=date.fromisoformat, help="End date YYYY-MM-DD.")
@@ -29,10 +32,13 @@ class Command(BaseCommand):
         errors = 0
         for symbol in opts["symbol"]:
             try:
-                s = fetch_historical_data(
-                    symbol, start, end, timespan=opts["timespan"], multiplier=opts["multiplier"]
-                )
-            except MassiveAPIError as exc:
+                if opts["market"] == "TH":
+                    s = backfill("TH", symbol, start, end)  # daily candles from Settrade
+                else:
+                    s = fetch_historical_data(
+                        symbol, start, end, timespan=opts["timespan"], multiplier=opts["multiplier"]
+                    )
+            except MarketDataError as exc:
                 errors += 1
                 self.stderr.write(self.style.ERROR(f"{symbol.upper()}: {exc}"))
                 continue

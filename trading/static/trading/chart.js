@@ -33,7 +33,7 @@
           maintainAspectRatio: false,
           interaction: { mode: "index", intersect: false },
           spanGaps: true,
-          scales: { x: { ticks: { maxTicksLimit: 10 } }, y: { ticks: { callback: (v) => "$" + v } } },
+          scales: { x: { ticks: { maxTicksLimit: 10 } }, y: { ticks: { callback: (v) => (data.currency || "$") + v } } },
           plugins: { legend: { position: "bottom", labels: { boxWidth: 10, usePointStyle: true } } },
         },
       });

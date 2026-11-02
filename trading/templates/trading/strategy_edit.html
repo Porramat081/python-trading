@@ -2,6 +2,7 @@
 {% block title %}{{ strategy.symbol }} · Algo Trader{% endblock %}
 {% block content %}
 <h1>{{ strategy.name }}</h1>
+<p class="muted small">{% if strategy.market == "TH" %}🇹🇭 Thai stock (SET) · limit orders in lots of 100{% else %}🇺🇸 US stock · market orders{% endif %}</p>
 <form method="post" class="stack">{% csrf_token %}
   {{ form.non_field_errors }}
   {% for field in form %}<label>{{ field.label }} {{ field }} {{ field.errors }}</label>{% endfor %}

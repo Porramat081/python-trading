@@ -6,7 +6,9 @@ A private Django trading bot that:
 - **Runs a momentum strategy:** a moving-average crossover (SMA or EMA) computed with pandas.
 - **Fully automatic:** adding a strategy backfills its data, evaluates it, switches it ON and enters a position
   if the trend is up. A built-in scheduler keeps every active strategy running during market hours.
-- **Places orders on Alpaca** through the [SnapTrade](https://snaptrade.com) API.
+- **Places orders on Alpaca** through the [SnapTrade](https://snaptrade.com) API (US stocks).
+- **Trades Thai stocks (SET)** through your Thai broker with the official
+  [Settrade Open API](https://developer.settrade.com) Python SDK (`settrade_v2`), side by side with US trading.
 - **Provides a web dashboard** (Django templates + Chart.js) and **Django admin** tools.
 
 > ⚠️ **Safety defaults.** `TRADING_ENABLED=False` (dry run: signals are logged but no orders are sent), and
@@ -27,6 +29,9 @@ trading/                     # main app: models, views, admin, templates, manage
 services/
   massive_service.py         # Massive REST client + fetch_historical_data() backfill
   snaptrade_service.py       # SnapTrade SDK wrapper: register, connect link, balances, positions, execute_order()
+  settrade_service.py        # Settrade Open API (settrade_v2): Thai candles, balances, positions, limit orders
+  brokers.py                 # one broker interface for SnapTrade (US) and Settrade (TH)
+  market_data.py             # candle storage + backfill routing (US -> Massive, TH -> Settrade)
   momentum_strategy.py       # SMA/EMA crossover engine -> BUY / SELL / HOLD and order execution
 requirements.txt
 .env.example
@@ -153,6 +158,60 @@ python manage.py run_strategy --strategy-id 1 --evaluate-only
 
 If you'd rather use cron than `run_scheduler`, schedule `run_strategy --all --backfill-days 5`.
 On **Strategies**, each row also has **Run** (evaluate now) and an **Auto** switch to turn a strategy on or off.
+
+## Thai stocks (SET) via Settrade
+
+Use the **🇺🇸 US / 🇹🇭 TH** switch in the header. Every page (Dashboard, Positions, Strategies, Settings) then
+shows only that market. US and Thai strategies run side by side.
+
+### 1. Get Settrade Open API access
+
+1. Use a stock account at a Thai broker that supports Settrade Open API, and enable Open API with them.
+2. Register an application on Settrade's developer site. You get an **App ID**, **App Secret** and **App Code**,
+   plus your **Broker ID**. Your **trading PIN** is needed to place orders.
+3. For testing, Settrade's sandbox uses Broker ID **`SANDBOX`** with sandbox app credentials.
+
+### 2. Add the account in the app
+
+Switch to **TH**, open **Settings** and fill in **Add Settrade account**. Click **Test** to check the login, account
+info, holdings and a sample PTT candle request. The result lists the fields Settrade returned.
+
+Credentials are stored **encrypted** in the database. Optionally set your own key in `.env`:
+
+```bash
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+Put the output in `FIELD_ENCRYPTION_KEY=`. Without it, a key derived from `DJANGO_SECRET_KEY` is used. If either key
+changes later, re-enter the credentials on the Settings page.
+
+### 3. Add Thai strategies
+
+On **Strategies** (with TH selected), enter a symbol such as `PTT`, `AOT` or `CPALL` and a quantity in shares, then
+click **Add & start**. The same automatic flow runs as for US: backfill from Settrade, evaluate, switch ON, and buy
+if the trend is up.
+
+**Thai market rules:**
+- **Board lots:** quantities are rounded down to multiples of 100 shares. The form requires at least 100.
+  A SELL of a 150-share holding sells 100.
+- **Limit orders:** each order is placed at the last price ± the strategy's **Slippage %** (under Advanced), rounded
+  to SET price steps. BUY prices round down and SELL prices round up, so the slippage limit is never exceeded.
+- **Prices:** Thai price history comes from Settrade itself, so Massive isn't needed for Thai stocks.
+- **Safety:**
+  - `TRADING_ENABLED=False` is a dry run for both markets.
+  - Broker ID `SANDBOX` counts as paper trading.
+  - A real broker ID is a live account, which needs `LIVE_TRADING=True`.
+- **Scheduler hours:** `run_scheduler` / `run.py` run Thai strategies during SET hours (Mon–Fri 10:00–12:30 and
+  14:30–16:30 Bangkok time, plus a run at 16:45). Thai holidays aren't detected.
+- **Manual backfill:**
+
+```bash
+python manage.py backfill_data --market TH --symbol PTT AOT --days 730
+```
+
+Settrade doesn't publish its response field names, so the parsers accept the expected names plus common
+alternatives. If **Test** reports 0 positions or 0 bars when you expected data, the field names may differ. Report
+the keys shown in the Test result so the parser can be adjusted.
 
 ### Signal logic
 

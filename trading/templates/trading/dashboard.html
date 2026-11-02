@@ -4,25 +4,20 @@
 <div class="head">
   <div>
     <div class="muted small">Portfolio value</div>
-    <div class="total">${{ total_value|floatformat:2 }}</div>
+    <div class="total">{{ CUR }}{{ total_value|floatformat:2 }}</div>
     <div class="accounts small">
       {% for card in account_cards %}
-        <span>{{ card.account.account_name|default:"Alpaca" }} · {% if card.account.is_paper %}paper{% else %}live{% endif %}
+        <span>{{ card.account.account_name|default:card.account.brokerage_name }} · {% if card.account.is_paper %}{% if card.account.is_settrade %}sandbox{% else %}paper{% endif %}{% else %}live{% endif %}
           {% if card.error %}<span class="err" title="{{ card.error }}">· unavailable</span>
-          {% elif card.balance %}· cash ${{ card.balance.cash|floatformat:2 }}{% endif %}</span>
+          {% elif card.balance %}· cash {{ CUR }}{{ card.balance.cash|floatformat:2 }}{% endif %}</span>
       {% empty %}
-        <span>{% if has_pending_registration %}Finish the SnapTrade connection, then sync.{% else %}No brokerage account linked.{% endif %}</span>
+        <span>{% if has_pending_registration %}Account not ready — see <a href="{% url 'trading:settings' %}">Settings</a>.{% else %}No {{ MARKET }} brokerage account. <a href="{% url 'trading:settings' %}">Add one in Settings</a>.{% endif %}</span>
       {% endfor %}
     </div>
   </div>
   <div>
-    {% if account_cards or has_pending_registration %}
-    <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}<button class="btn">Sync</button></form>
-    {% endif %}
-    {% if not account_cards %}
-    <form method="post" action="{% url 'trading:connect_brokerage' %}" class="inline">{% csrf_token %}
-      <button class="btn dark">Connect Alpaca{% if not LIVE_TRADING %} paper{% endif %}</button>
-    </form>
+    {% if MARKET == 'US' and account_cards %}
+    <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}<input type="hidden" name="next" value="{% url 'trading:dashboard' %}"><button class="btn">Sync</button></form>
     {% endif %}
   </div>
 </div>

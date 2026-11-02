@@ -14,17 +14,11 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
-class SnapTradeServiceError(Exception):
+from services.errors import BrokerError, TradingDisabledError  # noqa: E402,F401 (re-exported)
+
+
+class SnapTradeServiceError(BrokerError):
     """Raised for configuration problems or errors returned by SnapTrade / the brokerage."""
-
-    def __init__(self, message: str, status: int | None = None, body: Any = None):
-        super().__init__(message)
-        self.status = status
-        self.body = body
-
-
-class TradingDisabledError(SnapTradeServiceError):
-    """Raised when an order is attempted while the safety switches forbid it."""
 
 
 def to_plain(value: Any) -> Any:

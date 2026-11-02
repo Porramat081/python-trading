@@ -1,21 +1,27 @@
 {% extends "trading/base.html" %}
 {% block title %}Strategies · Algo Trader{% endblock %}
 {% block content %}
-<h1>Strategies</h1>
+<h1>Strategies · {{ MARKET }}</h1>
+{% if not has_account %}<p class="flash warning">No {{ MARKET }} brokerage account yet — strategies will track signals but can't trade. <a href="{% url 'trading:settings' %}">Add one in Settings</a>.</p>{% endif %}
 
 <form method="post" class="add">{% csrf_token %}
   {{ form.symbol.errors }}<input name="symbol" placeholder="Symbol" value="{{ form.symbol.value|default:'' }}" required autocomplete="off">
-  <input name="trade_quantity" type="number" step="any" min="0" placeholder="Qty" value="{{ form.trade_quantity.value|default:1 }}" required title="Units per order">
+  {% if MARKET == 'TH' %}
+  <input name="trade_quantity" type="number" step="100" min="100" placeholder="Shares" value="{{ form.trade_quantity.value|default:100 }}" required title="Shares per order (lots of 100)">
+  {% else %}
+  <input name="trade_quantity" type="number" step="any" min="0" placeholder="Qty" value="{{ form.trade_quantity.value|default:1 }}" required title="Shares per order">
+  {% endif %}
   {% if multi_account %}{{ form.account }}{% elif form.account.value %}<input type="hidden" name="account" value="{{ form.account.value }}">{% endif %}
   <button class="btn dark">Add &amp; start</button>
   <span class="muted small">Fetches data, evaluates, turns it on, and buys if the trend is up.</span>
-  {{ form.trade_quantity.errors }}{{ form.short_window.errors }}{{ form.non_field_errors }}
+  {{ form.trade_quantity.errors }}{{ form.short_window.errors }}{{ form.slippage_pct.errors }}{{ form.non_field_errors }}
   <details {% if form.errors %}open{% endif %}>
     <summary>Advanced</summary>
     <div class="adv">
       {{ form.ma_type }}
       <label class="small muted">Short {{ form.short_window }}</label>
       <label class="small muted">Long {{ form.long_window }}</label>
+      {% if MARKET == 'TH' %}<label class="small muted" title="Limit price = last price ± this %">Slippage % {{ form.slippage_pct }}</label>{% endif %}
       <input name="name" placeholder="Name (optional)" value="{{ form.name.value|default:'' }}">
     </div>
   </details>
@@ -31,7 +37,7 @@
       <td class="muted">{{ s.ma_type }} {{ s.short_window }}/{{ s.long_window }}</td>
       <td>{% if s.trend == 'UP' %}<span class="up">▲ up</span>{% elif s.trend == 'DOWN' %}<span class="down">▼ down</span>{% else %}<span class="muted">—</span>{% endif %}</td>
       <td class="{% if s.last_signal == 'BUY' %}up{% elif s.last_signal == 'SELL' %}down{% else %}muted{% endif %}">{{ s.last_signal|default:"—" }}</td>
-      <td class="num">{{ s.trade_quantity|floatformat:"-4" }}</td>
+      <td class="num">{{ s.trade_quantity|floatformat:"-4" }}{% if s.market == "TH" and s.slippage_pct %} <span class="muted small" title="Limit slippage">±{{ s.slippage_pct|floatformat:"-2" }}%</span>{% endif %}</td>
       {% if multi_account %}<td class="muted">{{ s.account.account_name|default:"—" }}</td>{% endif %}
       <td class="muted">{% if s.last_run %}{{ s.last_run|timesince }} ago{% else %}never{% endif %}</td>
       <td>
@@ -45,7 +51,7 @@
       </td>
     </tr>
   {% empty %}
-    <tr><td colspan="9" class="muted">No strategies yet. Try SPY, AAPL or MSFT.</td></tr>
+    <tr><td colspan="9" class="muted">No {{ MARKET }} strategies yet. Try {% if MARKET == 'TH' %}PTT, AOT or CPALL{% else %}SPY, AAPL or MSFT{% endif %}.</td></tr>
   {% endfor %}
   </tbody>
 </table>

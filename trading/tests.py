@@ -163,8 +163,7 @@ class StrategyRunTests(TestCase):
     def test_management_command(self):
         make_candles("AAPL", CROSS_UP)
         out = StringIO()
-        with mock.patch.object(ms.MomentumStrategy, "service", FakeService()):
-            call_command("run_strategy", "--symbol", "AAPL", stdout=out)
+        call_command("run_strategy", "--symbol", "AAPL", stdout=out)
         self.assertIn("BUY", out.getvalue())
 
 
@@ -404,3 +403,294 @@ class BackfillRefreshTests(TestCase):
         fetch_historical_data("AAPL", "2025-01-01", "2025-01-01", client=client)
         row = StockData.objects.get()
         self.assertEqual((row.close_price, row.volume), (Decimal("2.5"), 99))
+
+
+# ---------------------------------------------------------------------------
+# Thai market (Settrade)
+# ---------------------------------------------------------------------------
+from services import settrade_service as st  # noqa: E402
+from services.errors import OrderSkipped  # noqa: E402
+
+
+def make_th_candles(symbol, closes):
+    StockData.objects.bulk_create(
+        StockData(
+            market="TH", symbol=symbol, timestamp=START + timedelta(days=i),
+            open_price=c, high_price=c, low_price=c, close_price=c, volume=1000,
+        )
+        for i, c in enumerate(closes)
+    )
+
+
+class FakeEquity:
+    def __init__(self, portfolio=None, info=None):
+        self.orders = []
+        self.portfolio = portfolio if portfolio is not None else {"portfolioList": []}
+        self.info = info or {"cashBalance": 50000, "lineAvailable": 40000}
+
+    def get_portfolios(self):
+        return self.portfolio
+
+    def get_account_info(self):
+        return self.info
+
+    def place_order(self, **kwargs):
+        self.orders.append(kwargs)
+        return {"orderNo": "TH-1"}
+
+
+class FakeMarket:
+    def __init__(self, last=33.75, candles=None):
+        self.last = last
+        self.candles = candles or {"time": [], "open": [], "high": [], "low": [], "close": [], "volume": []}
+
+    def get_quote_symbol(self, symbol):
+        return {"symbol": symbol, "last": self.last}
+
+    def get_candlestick(self, **kwargs):
+        return self.candles
+
+
+class FakeInvestor:
+    def __init__(self, equity=None, market=None):
+        self.equity = equity or FakeEquity()
+        self.market = market or FakeMarket()
+
+    def Equity(self, account_no):
+        return self.equity
+
+    def MarketData(self):
+        return self.market
+
+
+class ThaiRulesTests(TestCase):
+    def test_tick_rounding(self):
+        self.assertEqual(st.round_to_tick(1.234, "down"), Decimal("1.23"))
+        self.assertEqual(st.round_to_tick(33.9, "down"), Decimal("33.75"))
+        self.assertEqual(st.round_to_tick(33.9, "up"), Decimal("34.00"))
+        self.assertEqual(st.round_to_tick(150.3, "up"), Decimal("150.50"))
+        self.assertEqual(st.round_to_tick(401, "down"), Decimal("400.00"))
+
+    def test_board_lots_and_limit_price(self):
+        self.assertEqual(st.to_board_lots(250), 200)
+        self.assertEqual(st.to_board_lots(99), 0)
+        self.assertEqual(st.limit_price(34, "BUY", 1), Decimal("34.25"))   # 34.34 -> down to 0.25 step
+        self.assertEqual(st.limit_price(34, "SELL", 1), Decimal("33.75"))  # 33.66 -> up to 0.25 step
+        self.assertEqual(st.limit_price(34, "BUY", 0), Decimal("34.00"))
+
+    def test_parse_candles_both_shapes(self):
+        cols = {"time": [1735689600, 1735776000], "open": [1, 2], "high": [1, 2], "low": [1, 2],
+                "close": [1.5, 2.5], "volume": [10, 20]}
+        candles = st.parse_candles("ptt", cols)
+        self.assertEqual([c.close for c in candles], [Decimal("1.5"), Decimal("2.5")])
+        rows = [{"time": "2025-01-01T00:00:00", "open": 1, "high": 1, "low": 1, "close": 3, "volume": 5}]
+        self.assertEqual(st.parse_candles("PTT", rows)[0].close, Decimal("3"))
+
+    def test_parse_positions(self):
+        payload = {"portfolioList": [
+            {"symbol": "PTT", "actualVolume": 300, "availableVolume": 200, "marketPrice": 34, "averagePrice": 32},
+            {"symbol": "AOT", "actualVolume": 0},
+        ]}
+        positions = st.parse_positions(payload)
+        self.assertEqual(len(positions), 1)
+        self.assertEqual((positions[0]["units"], positions[0]["available_units"]), (300, 200))
+        self.assertEqual(positions[0]["market_value"], 10200)
+
+
+class SettradeServiceTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("thai", password="pw-123456")
+        self.account = BrokerageAccount.objects.create(
+            user=self.user, provider="SETTRADE", account_id="1234567", settrade_broker_id="SANDBOX",
+            settrade_app_id="app", settrade_app_secret="secret", settrade_app_code="code", settrade_pin="000000",
+        )
+
+    def service(self, investor):
+        return st.SettradeService(self.account, investor_factory=lambda acc: investor)
+
+    def test_credentials_encrypted_and_sandbox_is_paper(self):
+        from django.db import connection
+
+        self.account.refresh_from_db()
+        self.assertTrue(self.account.is_paper)
+        self.assertEqual(self.account.settrade_pin, "000000")
+        with connection.cursor() as cur:
+            cur.execute("SELECT settrade_pin, settrade_app_secret FROM trading_brokerageaccount WHERE id=%s", [self.account.pk])
+            raw_pin, raw_secret = cur.fetchone()
+        self.assertTrue(raw_pin.startswith("enc1:") and raw_secret.startswith("enc1:"))
+        self.assertNotIn("000000", raw_pin)
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_places_limit_order_in_lots(self):
+        investor = FakeInvestor()
+        order = self.service(investor).execute_order("ptt", "BUY", 250, slippage_pct=1)
+        placed = investor.equity.orders[0]
+        self.assertEqual((placed["side"], placed["symbol"], placed["volume"]), ("Buy", "PTT", 200))
+        self.assertEqual((placed["price"], placed["price_type"], placed["pin"]), (34.0, "Limit", "000000"))
+        self.assertEqual((order["order_id"], order["quantity"]), ("TH-1", 200))
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_below_one_lot_is_skipped(self):
+        with self.assertRaises(OrderSkipped):
+            self.service(FakeInvestor()).execute_order("PTT", "BUY", 50)
+
+    @override_settings(TRADING_ENABLED=True, LIVE_TRADING=False)
+    def test_live_settrade_account_blocked(self):
+        self.account.settrade_broker_id = "023"
+        self.account.save()
+        self.assertFalse(self.account.is_paper)
+        with self.assertRaises(TradingDisabledError):
+            self.service(FakeInvestor()).execute_order("PTT", "BUY", 100)
+
+    @override_settings(TRADING_ENABLED=False)
+    def test_dry_run_blocked(self):
+        with self.assertRaises(TradingDisabledError):
+            self.service(FakeInvestor()).execute_order("PTT", "BUY", 100)
+
+    def test_balances_and_sellable_units(self):
+        investor = FakeInvestor(FakeEquity({"portfolioList": [
+            {"symbol": "PTT", "actualVolume": 300, "availableVolume": 200, "marketPrice": 34}]}))
+        svc = self.service(investor)
+        self.assertEqual(svc.get_position_units("ptt"), 200)
+        balances = svc.get_balances()
+        self.assertEqual((balances["cash"], balances["net_value"], balances["currency"]), (50000, 50000 + 10200, "THB"))
+
+    def test_sdk_environment_is_reset_before_login(self):
+        from settrade_v2.config import config as sdk_config
+
+        with mock.patch("settrade_v2.Investor") as investor_cls:
+            st.SettradeService(self.account)._login()
+            self.assertEqual(sdk_config["environment"], "uat")
+            self.account.settrade_broker_id = "023"
+            self.account.save()
+            st.SettradeService(self.account)._login()
+            self.assertEqual(sdk_config["environment"], "prod")
+            self.assertEqual(investor_cls.call_args.kwargs["broker_id"], "023")
+
+    def test_sdk_errors_become_broker_errors(self):
+        from settrade_v2.errors import SettradeError
+
+        class BadEquity(FakeEquity):
+            def get_portfolios(self):
+                raise SettradeError(code="E1", message="Invalid account", status_code=400)
+
+        with self.assertRaises(st.SettradeServiceError):
+            self.service(FakeInvestor(BadEquity())).get_positions()
+
+
+class ThaiStrategyTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("thai", password="pw-123456")
+        self.account = BrokerageAccount.objects.create(
+            user=self.user, provider="SETTRADE", account_id="1234567", settrade_broker_id="SANDBOX",
+            settrade_app_id="app", settrade_app_secret="secret", settrade_app_code="code", settrade_pin="000000",
+        )
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_th_strategy_backfills_from_settrade_and_buys_lots(self):
+        closes = UPTREND
+        candles = {"time": [int((START + timedelta(days=i)).timestamp()) for i in range(len(closes))],
+                   "open": closes, "high": closes, "low": closes, "close": closes, "volume": [1] * len(closes)}
+        investor = FakeInvestor(market=FakeMarket(last=139, candles=candles))
+        strategy = StrategyConfig.objects.create(
+            name="PTT", market="TH", symbol="PTT", short_window=3, long_window=10,
+            account=self.account, trade_quantity=Decimal("150"),
+        )
+        with mock.patch.object(st.SettradeService, "_login", lambda self: investor):
+            result = ms.start_strategy(strategy)
+        self.assertEqual(StockData.objects.filter(market="TH", symbol="PTT").count(), len(closes))
+        self.assertFalse(StockData.objects.filter(market="US").exists())
+        self.assertEqual(result.extra["trend"], "UP")
+        self.assertEqual(investor.equity.orders[0]["volume"], 100)
+        log = TradeLog.objects.get()
+        self.assertEqual((log.status, log.quantity, log.order_id), ("EXECUTED", Decimal("100"), "TH-1"))
+
+    def test_markets_are_isolated(self):
+        make_candles("PTT", CROSS_UP)            # a US ticker that happens to share the name
+        make_th_candles("PTT", [30.0] * 40)      # flat Thai prices
+        th = StrategyConfig.objects.create(name="t", market="TH", symbol="PTT", short_window=3, long_window=10)
+        us = StrategyConfig.objects.create(name="u", market="US", symbol="PTT", short_window=3, long_window=10)
+        self.assertEqual(ms.MomentumStrategy(th).evaluate().signal, "HOLD")
+        self.assertEqual(ms.MomentumStrategy(us).evaluate().signal, "BUY")
+
+    @override_settings(TRADING_ENABLED=True)
+    def test_account_from_wrong_market_does_not_trade(self):
+        make_candles("AAPL", CROSS_UP)
+        strategy = StrategyConfig.objects.create(
+            name="x", market="US", symbol="AAPL", short_window=3, long_window=10, account=self.account
+        )
+        result = ms.MomentumStrategy(strategy, broker=mock.Mock()).run()
+        self.assertIn("TH market", result.message)
+        self.assertFalse(TradeLog.objects.exists())
+
+    def test_thai_hours(self):
+        from zoneinfo import ZoneInfo
+
+        from trading.management.commands.run_scheduler import market_is_open
+
+        bkk = ZoneInfo("Asia/Bangkok")
+        self.assertTrue(market_is_open(datetime(2026, 11, 2, 10, 30, tzinfo=bkk), "TH"))
+        self.assertFalse(market_is_open(datetime(2026, 11, 2, 13, 0, tzinfo=bkk), "TH"))  # lunch break
+        self.assertTrue(market_is_open(datetime(2026, 11, 2, 15, 0, tzinfo=bkk), "TH"))
+        self.assertFalse(market_is_open(datetime(2026, 11, 2, 15, 0, tzinfo=bkk), "US"))
+
+
+@override_settings(SNAPTRADE_CLIENT_ID="", SNAPTRADE_CONSUMER_KEY="")
+class ThaiUITests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("thai", password="pw-123456")
+        self.client.force_login(self.user)
+        self.client.post(reverse("trading:set_market", args=["TH"]))
+
+    def add_account(self, **extra):
+        data = {"account_name": "", "account_id": "1234567", "settrade_broker_id": "sandbox",
+                "settrade_app_id": "app", "settrade_app_secret": "s", "settrade_app_code": "c", "settrade_pin": "111111"}
+        data.update(extra)
+        return self.client.post(reverse("trading:settings"), data)
+
+    def test_switch_and_pages_render_in_th(self):
+        self.assertEqual(self.client.session["market"], "TH")
+        for name in ("trading:dashboard", "trading:positions", "trading:strategies", "trading:settings"):
+            response = self.client.get(reverse(name))
+            self.assertEqual(response.status_code, 200, name)
+        self.assertContains(self.client.get(reverse("trading:settings")), "Add Settrade account")
+        self.assertContains(self.client.get(reverse("trading:dashboard")), "฿")
+
+    def test_add_and_edit_settrade_account_keeps_secrets(self):
+        self.add_account()
+        account = BrokerageAccount.objects.get()
+        self.assertEqual((account.provider, account.settrade_broker_id, account.is_paper), ("SETTRADE", "SANDBOX", True))
+        self.assertEqual(account.account_name, "Settrade 1234567")
+        self.client.post(reverse("trading:settrade_edit", args=[account.pk]), {
+            "account_name": "Main", "account_id": "1234567", "settrade_broker_id": "SANDBOX",
+            "settrade_app_id": "app", "settrade_app_secret": "", "settrade_app_code": "", "settrade_pin": "",
+        })
+        account.refresh_from_db()
+        self.assertEqual((account.account_name, account.settrade_pin, account.settrade_app_secret), ("Main", "111111", "s"))
+
+    def test_th_strategy_form_rules_and_filtering(self):
+        self.add_account()
+        StrategyConfig.objects.create(name="us", market="US", symbol="SPY", short_window=3, long_window=10)
+        response = self.client.post(reverse("trading:strategies"), {
+            "symbol": "ptt", "trade_quantity": "50", "ma_type": "SMA", "short_window": 10, "long_window": 50,
+        })
+        self.assertContains(response, "lots of 100")
+        with mock.patch("trading.views.start_strategy") as start:
+            start.return_value = ms.StrategyResult(strategy="x", symbol="PTT", signal="HOLD", message="ok")
+            self.client.post(reverse("trading:strategies"), {
+                "symbol": "ptt", "trade_quantity": "200", "ma_type": "SMA", "short_window": 10,
+                "long_window": 50, "slippage_pct": "0.5", "account": BrokerageAccount.objects.get().pk,
+            })
+        strategy = StrategyConfig.objects.get(symbol="PTT")
+        self.assertEqual((strategy.market, strategy.slippage_pct), ("TH", Decimal("0.50")))
+        self.assertEqual(strategy.account.provider, "SETTRADE")
+        page = self.client.get(reverse("trading:strategies")).content.decode()
+        self.assertIn("PTT", page)
+        self.assertNotIn("SPY", page.split("<tbody>")[1])
+
+    def test_connection_button(self):
+        self.add_account()
+        account = BrokerageAccount.objects.get()
+        with mock.patch.object(st.SettradeService, "test_connection", return_value={"ok": True, "steps": ["Account info OK"]}):
+            response = self.client.post(reverse("trading:settrade_test", args=[account.pk]), follow=True)
+        self.assertContains(response, "Account info OK")

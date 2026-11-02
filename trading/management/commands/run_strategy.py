@@ -17,6 +17,7 @@ class Command(BaseCommand):
         target.add_argument("--symbol", help="Run active strategies for this ticker (e.g. AAPL).")
         target.add_argument("--strategy-id", type=int, help="Run one strategy by ID (even if inactive).")
         target.add_argument("--all", action="store_true", help="Run every active strategy.")
+        parser.add_argument("--market", choices=["US", "TH"], help="Limit to one market.")
         parser.add_argument(
             "--backfill-days",
             type=int,
@@ -36,21 +37,28 @@ class Command(BaseCommand):
             strategies = StrategyConfig.objects.filter(symbol=opts["symbol"].upper(), is_active=True)
         else:
             strategies = StrategyConfig.objects.filter(is_active=True)
+        if opts["market"]:
+            strategies = strategies.filter(market=opts["market"])
         strategies = list(strategies.select_related("account"))
         if not strategies:
             raise CommandError("No matching strategies found (is the strategy active?).")
 
         if opts["backfill_days"]:
-            from services.massive_service import MassiveAPIError, fetch_historical_data
+            from services.errors import MarketDataError
+            from services.market_data import backfill
 
             end = date.today()
             start = end - timedelta(days=opts["backfill_days"])
-            for symbol in sorted({s.symbol for s in strategies}):
+            done = set()
+            for s in strategies:
+                if (s.market, s.symbol) in done:
+                    continue
+                done.add((s.market, s.symbol))
                 try:
-                    summary = fetch_historical_data(symbol, start, end)
-                    self.stdout.write(f"Backfill {symbol}: {summary['created']} new candles")
-                except MassiveAPIError as exc:
-                    self.stderr.write(self.style.WARNING(f"Backfill {symbol} failed: {exc}"))
+                    summary = backfill(s.market, s.symbol, start, end, account=s.account)
+                    self.stdout.write(f"Backfill {s.market}:{s.symbol}: {summary['created']} new candles")
+                except MarketDataError as exc:
+                    self.stderr.write(self.style.WARNING(f"Backfill {s.market}:{s.symbol} failed: {exc}"))
 
         failures = 0
         for strategy in strategies:

@@ -78,11 +78,11 @@ def generate_signal(closes: pd.Series, short_window: int, long_window: int, ma_t
     return str(df["signal"].iloc[-1])
 
 
-def load_closes(symbol: str, limit: int | None = None) -> pd.Series:
+def load_closes(symbol: str, limit: int | None = None, market: str = "US") -> pd.Series:
     """Load close prices from StockData as a time-indexed Series (ascending)."""
     from trading.models import StockData
 
-    qs = StockData.objects.filter(symbol=symbol.upper()).order_by("-timestamp")
+    qs = StockData.objects.filter(market=market, symbol=symbol.upper()).order_by("-timestamp")
     if limit:
         qs = qs[:limit]
     rows = list(qs.values_list("timestamp", "close_price"))
@@ -95,7 +95,7 @@ def load_closes(symbol: str, limit: int | None = None) -> pd.Series:
 
 def chart_data(strategy, limit: int = 300) -> dict:
     """Prices + indicator lines + crossover markers for the dashboard chart."""
-    closes = load_closes(strategy.symbol, limit=limit + strategy.long_window)
+    closes = load_closes(strategy.symbol, limit=limit + strategy.long_window, market=strategy.market)
     if closes.empty:
         return {"labels": [], "close": [], "short_ma": [], "long_ma": [], "signals": []}
     df = compute_indicators(closes, strategy.short_window, strategy.long_window, strategy.ma_type)
@@ -124,23 +124,25 @@ UP, DOWN = "UP", "DOWN"
 
 
 class MomentumStrategy:
-    """Evaluates a StrategyConfig and (optionally) sends orders via SnapTrade."""
+    """Evaluates a StrategyConfig and (optionally) sends orders through the account's broker
+    (SnapTrade/Alpaca for US, Settrade for TH)."""
 
-    def __init__(self, config, snaptrade_service=None):
+    def __init__(self, config, snaptrade_service=None, broker=None):
         self.config = config
-        self._service = snaptrade_service
+        self._snaptrade_service = snaptrade_service
+        self._broker = broker
 
     @property
-    def service(self):
-        if self._service is None:
-            from services.snaptrade_service import SnapTradeService
+    def broker(self):
+        if self._broker is None:
+            from services.brokers import get_broker
 
-            self._service = SnapTradeService()
-        return self._service
+            self._broker = get_broker(self.config.account, snaptrade_service=self._snaptrade_service)
+        return self._broker
 
     def evaluate(self) -> StrategyResult:
         cfg = self.config
-        closes = load_closes(cfg.symbol, limit=max(cfg.long_window * 5, 500))
+        closes = load_closes(cfg.symbol, limit=max(cfg.long_window * 5, 500), market=cfg.market)
         result = StrategyResult(strategy=cfg.name, symbol=cfg.symbol, signal=HOLD)
         if len(closes) < cfg.long_window + 1:
             result.message = (
@@ -198,16 +200,17 @@ class MomentumStrategy:
            long MA (uptrend) and the signal is not SELL, buy now. Otherwise wait for the
            next BUY crossover.
         """
-        from services.massive_service import MassiveAPIError, fetch_historical_data
+        from services.errors import MarketDataError
+        from services.market_data import backfill
 
         cfg = self.config
         days = backfill_days or max(730, cfg.long_window * 4)
         end = timezone.now().date()
         backfill_note = ""
         try:
-            summary = fetch_historical_data(cfg.symbol, end - timedelta(days=days), end)
+            summary = backfill(cfg.market, cfg.symbol, end - timedelta(days=days), end, account=cfg.account)
             backfill_note = f"Backfilled {summary['created']} new candles. "
-        except MassiveAPIError as exc:
+        except MarketDataError as exc:
             backfill_note = f"Backfill failed ({exc}). "
             logger.warning("Backfill for %s failed: %s", cfg.symbol, exc)
 
@@ -231,13 +234,16 @@ class MomentumStrategy:
     def _trade(self, result: StrategyResult, action: str, entry: bool = False) -> None:
         from django.conf import settings
 
-        from services.snaptrade_service import SnapTradeServiceError, TradingDisabledError
+        from services.errors import BrokerError, OrderSkipped, TradingDisabledError
         from trading.models import TradeLog
 
         cfg = self.config
         account = cfg.account
         if account is None or not account.is_linked:
             result.message = f"{action} signal, but no linked brokerage account is set on this strategy."
+            return
+        if account.market != cfg.market:
+            result.message = f"{action} signal, but the account is for the {account.market} market."
             return
 
         quantity = Decimal(cfg.trade_quantity)
@@ -260,14 +266,10 @@ class MomentumStrategy:
         if not settings.TRADING_ENABLED:
             return finish(TradeLog.Status.SKIPPED, "Dry run: TRADING_ENABLED is False.")
 
+        broker = self.broker
         try:
             if action == SELL or entry:
-                held = self.service.get_position_units(
-                    account.snaptrade_user_id,
-                    account.snaptrade_user_secret,
-                    account.account_id,
-                    cfg.symbol,
-                )
+                held = broker.get_position_units(cfg.symbol)
                 if entry and held > 0:
                     return finish(TradeLog.Status.SKIPPED, f"Already holding {held:g} {cfg.symbol}; no entry buy.")
                 if action == SELL and held <= 0:
@@ -276,23 +278,22 @@ class MomentumStrategy:
                     quantity = Decimal(str(held))
                     log.quantity = quantity
 
-            order = self.service.execute_order(
-                user_id=account.snaptrade_user_id,
-                user_secret=account.snaptrade_user_secret,
-                account_id=account.account_id,
+            order = broker.execute_order(
                 symbol=cfg.symbol,
                 side=action,
                 units=quantity,
-                order_type="Market",
-                is_paper=account.is_paper,
+                ref_price=result.close,
+                slippage_pct=cfg.slippage_pct,
             )
             log.order_id = order["order_id"]
+            if order.get("quantity") is not None:
+                log.quantity = Decimal(str(order["quantity"]))
             if order.get("price"):
                 log.price = Decimal(str(order["price"]))
             finish(TradeLog.Status.EXECUTED, f"Broker status: {order.get('status') or 'submitted'}")
-        except TradingDisabledError as exc:
+        except (TradingDisabledError, OrderSkipped) as exc:
             finish(TradeLog.Status.SKIPPED, str(exc))
-        except SnapTradeServiceError as exc:
+        except BrokerError as exc:
             logger.error("Order failed for %s: %s", cfg, exc)
             finish(TradeLog.Status.FAILED, str(exc))
 
@@ -301,23 +302,35 @@ def run_strategy(config, execute: bool = True) -> StrategyResult:
     return MomentumStrategy(config).run(execute=execute)
 
 
-def start_strategy(config, snaptrade_service=None) -> StrategyResult:
+def start_strategy(config, snaptrade_service=None, broker=None) -> StrategyResult:
     """Backfill, evaluate, switch ON and (trend permitting) enter a new strategy."""
-    return MomentumStrategy(config, snaptrade_service=snaptrade_service).start()
+    return MomentumStrategy(config, snaptrade_service=snaptrade_service, broker=broker).start()
 
 
-def refresh_and_run_active(backfill_days: int = 7, execute: bool = True, log=print) -> list[StrategyResult]:
-    """Refresh recent candles for every active symbol and run all active strategies."""
-    from services.massive_service import MassiveAPIError, fetch_historical_data
+def refresh_and_run_active(
+    backfill_days: int = 7, execute: bool = True, log=print, market: str | None = None
+) -> list[StrategyResult]:
+    """Refresh recent candles for every active symbol and run all active strategies
+    (optionally only those of one market)."""
+    from services.errors import MarketDataError
+    from services.market_data import backfill
     from trading.models import StrategyConfig
 
-    strategies = list(StrategyConfig.objects.filter(is_active=True).select_related("account"))
+    qs = StrategyConfig.objects.filter(is_active=True).select_related("account")
+    if market:
+        qs = qs.filter(market=market)
+    strategies = list(qs)
     end = timezone.now().date()
-    for symbol in sorted({s.symbol for s in strategies}):
+    seen = set()
+    for strategy in strategies:
+        key = (strategy.market, strategy.symbol)
+        if key in seen:
+            continue
+        seen.add(key)
         try:
-            fetch_historical_data(symbol, end - timedelta(days=backfill_days), end)
-        except MassiveAPIError as exc:
-            log(f"Backfill {symbol} failed: {exc}")
+            backfill(strategy.market, strategy.symbol, end - timedelta(days=backfill_days), end, account=strategy.account)
+        except MarketDataError as exc:
+            log(f"Backfill {strategy.market}:{strategy.symbol} failed: {exc}")
     results = []
     for strategy in strategies:
         try:
@@ -326,6 +339,6 @@ def refresh_and_run_active(backfill_days: int = 7, execute: bool = True, log=pri
             logger.exception("Strategy %s failed", strategy)
             log(f"[{strategy.name}] error: {exc}")
             continue
-        log(str(result))
+        log(f"{strategy.market} {result}")
         results.append(result)
     return results

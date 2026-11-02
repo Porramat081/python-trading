@@ -8,7 +8,7 @@
       <td><strong>{{ t.symbol }}</strong></td>
       <td class="{% if t.action == 'BUY' %}up{% else %}down{% endif %}">{{ t.action }}</td>
       <td class="num">{{ t.quantity|floatformat:"-4" }}</td>
-      <td class="num">{{ t.price|floatformat:2|default:"—" }}</td>
+      <td class="num">{% if t.price %}{{ CUR }}{{ t.price|floatformat:2 }}{% else %}—{% endif %}</td>
       <td class="status-{{ t.status|lower }}">{{ t.get_status_display }}</td>
       <td class="note">{{ t.message|truncatechars:90 }}</td>
     </tr>

@@ -1,0 +1,59 @@
+{% extends "trading/base.html" %}
+{% block title %}Settings · Algo Trader{% endblock %}
+{% block content %}
+<h1>Settings · {% if MARKET == 'TH' %}🇹🇭 Thai stocks{% else %}🇺🇸 US stocks{% endif %}</h1>
+<p class="muted small">Showing accounts for the market selected in the header switch.</p>
+
+<h2>Accounts</h2>
+<div class="cards">
+  {% for a in accounts %}
+  <div class="acct">
+    <div>
+      <strong>{{ a.account_name|default:a.account_id|default:"Pending connection" }}</strong>
+      {% if a.is_paper %}<span class="tag paper">{% if a.is_settrade %}sandbox{% else %}paper{% endif %}</span>{% else %}<span class="tag live">live</span>{% endif %}
+      <div class="muted small">
+        {% if a.is_settrade %}Broker {{ a.settrade_broker_id }} · account {{ a.account_id }} · PIN {% if a.settrade_pin %}set{% else %}<span class="err">missing</span>{% endif %}
+        {% elif a.is_linked %}Alpaca via SnapTrade · {{ a.account_id|truncatechars:14 }}
+        {% else %}Registered with SnapTrade — finish linking Alpaca, then Sync.{% endif %}
+      </div>
+    </div>
+    <div class="actions">
+      {% if a.is_settrade %}
+        <form method="post" action="{% url 'trading:settrade_test' a.pk %}" class="inline">{% csrf_token %}<button class="btn">Test</button></form>
+        <a class="quiet" href="{% url 'trading:settrade_edit' a.pk %}">Edit</a>
+      {% endif %}
+      <form method="post" action="{% url 'trading:account_delete' a.pk %}" class="inline" onsubmit="return confirm('Remove this account?');">{% csrf_token %}
+        <button class="quiet err">Remove</button>
+      </form>
+    </div>
+  </div>
+  {% empty %}
+  <p class="muted">No {{ MARKET }} account yet.</p>
+  {% endfor %}
+</div>
+
+{% if MARKET == 'US' %}
+  <h2>Connect Alpaca</h2>
+  <p class="hint">Links your Alpaca {% if LIVE_TRADING %}live{% else %}paper{% endif %} account through SnapTrade. After finishing in SnapTrade you are sent back here; click Sync if the account doesn't appear.</p>
+  <form method="post" action="{% url 'trading:connect_brokerage' %}" class="inline">{% csrf_token %}
+    <button class="btn dark">Connect Alpaca{% if not LIVE_TRADING %} paper{% endif %}</button>
+  </form>
+  <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}<button class="btn">Sync</button></form>
+{% else %}
+  <h2>{% if editing %}Edit Settrade account{% else %}Add Settrade account{% endif %}</h2>
+  <p class="hint">
+    Get these from your broker after enabling Settrade Open API. Use Broker ID <code>SANDBOX</code> for Settrade's
+    test environment (treated like paper trading). Secrets and PIN are stored encrypted.
+  </p>
+  <form method="post" action="{% if editing %}{% url 'trading:settrade_edit' editing.pk %}{% else %}{% url 'trading:settings' %}{% endif %}">{% csrf_token %}
+    {{ form.non_field_errors }}
+    <div class="grid2">
+      {% for field in form %}<label>{{ field.label }} {{ field }} {{ field.errors }}</label>{% endfor %}
+    </div>
+    <p style="margin-top:14px">
+      <button class="btn dark">{% if editing %}Save changes{% else %}Add account{% endif %}</button>
+      {% if editing %}<a class="btn" href="{% url 'trading:settings' %}">Cancel</a>{% endif %}
+    </p>
+  </form>
+{% endif %}
+{% endblock %}

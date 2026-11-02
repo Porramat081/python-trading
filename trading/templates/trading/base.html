@@ -15,9 +15,18 @@
     <a href="{% url 'trading:dashboard' %}" {% if n == 'dashboard' %}class="on"{% endif %}>Dashboard</a>
     <a href="{% url 'trading:positions' %}" {% if n == 'positions' %}class="on"{% endif %}>Positions</a>
     <a href="{% url 'trading:strategies' %}" {% if 'strateg' in n %}class="on"{% endif %}>Strategies</a>
+    <a href="{% url 'trading:settings' %}" {% if n == 'settings' or n == 'settrade_edit' %}class="on"{% endif %}>Settings</a>
   </nav>
   {% endwith %}
   <div class="end">
+    <div class="seg" role="group" aria-label="Market">
+      {% for code, label in MARKETS %}
+      <form method="post" action="{% url 'trading:set_market' code %}">{% csrf_token %}
+        <input type="hidden" name="next" value="{{ request.get_full_path }}">
+        <button class="{% if MARKET == code %}on{% endif %}" title="{{ label }}">{% if code == 'US' %}🇺🇸 US{% else %}🇹🇭 TH{% endif %}</button>
+      </form>
+      {% endfor %}
+    </div>
     <span class="mode {% if TRADING_ENABLED %}{% if LIVE_TRADING %}live{% else %}paper{% endif %}{% endif %}"
           title="{% if not TRADING_ENABLED %}Orders are not sent (TRADING_ENABLED=False){% endif %}">
       {% if not TRADING_ENABLED %}Dry run{% elif LIVE_TRADING %}Live{% else %}Paper{% endif %}

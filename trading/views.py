@@ -1,4 +1,5 @@
 import logging
+
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
@@ -6,51 +7,87 @@ from django.db import transaction
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils.http import url_has_allowed_host_and_scheme
 from django.views.decorators.http import require_POST
 
+from services.brokers import get_broker
+from services.errors import BrokerError
 from services.momentum_strategy import chart_data, run_strategy, start_strategy
+from services.settrade_service import SettradeService
 from services.snaptrade_service import SnapTradeService, SnapTradeServiceError
 
-from .forms import StrategyConfigForm, linked_accounts
-from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
+from .forms import SettradeAccountForm, StrategyConfigForm, linked_accounts
+from .models import MARKET_SYMBOL, BrokerageAccount, Market, StockData, StrategyConfig, TradeLog
 
 logger = logging.getLogger(__name__)
+SNAPTRADE = BrokerageAccount.Provider.SNAPTRADE
+SETTRADE = BrokerageAccount.Provider.SETTRADE
 
 
-def _user_accounts(user):
+def current_market(request) -> str:
+    market = request.session.get("market", Market.US)
+    return market if market in Market.values else Market.US
+
+
+def _provider(market):
+    return SETTRADE if market == Market.TH else SNAPTRADE
+
+
+def _user_accounts(user, market=None):
     qs = BrokerageAccount.objects.all() if user.is_superuser else BrokerageAccount.objects.filter(user=user)
+    if market:
+        qs = qs.filter(provider=_provider(market))
     return qs.order_by("brokerage_name", "account_name")
 
 
-def _service_or_none(request):
-    try:
-        return SnapTradeService()
-    except SnapTradeServiceError as exc:
-        messages.warning(request, str(exc))
-        return None
+def _safe_next(request, fallback):
+    nxt = request.POST.get("next") or request.META.get("HTTP_REFERER")
+    if nxt and url_has_allowed_host_and_scheme(nxt, allowed_hosts={request.get_host()}):
+        return nxt
+    return reverse(fallback)
+
+
+def _brokers_for(accounts):
+    """Yield (account, broker, error). One SnapTrade client is shared by all US accounts."""
+    snaptrade, snaptrade_error = None, None
+    for account in accounts:
+        if not account.is_settrade and snaptrade is None and snaptrade_error is None:
+            try:
+                snaptrade = SnapTradeService()
+            except SnapTradeServiceError as exc:
+                snaptrade_error = str(exc)
+        if not account.is_settrade and snaptrade_error:
+            yield account, None, snaptrade_error
+        else:
+            yield account, get_broker(account, snaptrade_service=snaptrade), None
+
+
+@login_required
+@require_POST
+def set_market(request, code):
+    if code in Market.values:
+        request.session["market"] = code
+    return redirect(_safe_next(request, "trading:dashboard"))
 
 
 @login_required
 def dashboard(request):
-    accounts = list(_user_accounts(request.user))
+    market = current_market(request)
+    accounts = list(_user_accounts(request.user, market))
     linked = [a for a in accounts if a.is_linked]
-    service = _service_or_none(request) if linked else None
 
-    account_cards = []
-    total_value = 0.0
-    for account in linked:
-        card = {"account": account, "balance": None, "error": None}
-        if service:
+    account_cards, total_value = [], 0.0
+    for account, broker, error in _brokers_for(linked):
+        card = {"account": account, "balance": None, "error": error}
+        if broker:
             try:
-                card["balance"] = service.get_balances(
-                    account.snaptrade_user_id, account.snaptrade_user_secret, account.account_id
-                )
+                card["balance"] = broker.get_balances()
                 total_value += card["balance"]["net_value"] or 0
-            except SnapTradeServiceError as exc:
+            except BrokerError as exc:
                 card["error"] = str(exc)
         account_cards.append(card)
 
-    strategies = list(StrategyConfig.objects.select_related("account").order_by("name"))
+    strategies = list(StrategyConfig.objects.filter(market=market).select_related("account").order_by("symbol"))
     selected_id = request.GET.get("strategy")
     selected = next((s for s in strategies if str(s.pk) == selected_id), strategies[0] if strategies else None)
 
@@ -61,24 +98,24 @@ def dashboard(request):
         "recent_trades": TradeLog.objects.filter(account__in=accounts).select_related("account", "strategy")[:10],
         "strategies": strategies,
         "selected_strategy": selected,
-        "candle_count": StockData.objects.filter(symbol=selected.symbol).count() if selected else 0,
+        "candle_count": (
+            StockData.objects.filter(market=market, symbol=selected.symbol).count() if selected else 0
+        ),
     }
     return render(request, "trading/dashboard.html", context)
 
 
 @login_required
 def positions(request):
-    accounts = [a for a in _user_accounts(request.user) if a.is_linked]
-    service = _service_or_none(request) if accounts else None
+    market = current_market(request)
+    accounts = [a for a in _user_accounts(request.user, market) if a.is_linked]
     rows = []
-    for account in accounts:
-        entry = {"account": account, "positions": [], "error": None}
-        if service:
+    for account, broker, error in _brokers_for(accounts):
+        entry = {"account": account, "positions": [], "error": error}
+        if broker:
             try:
-                entry["positions"] = service.get_positions(
-                    account.snaptrade_user_id, account.snaptrade_user_secret, account.account_id
-                )
-            except SnapTradeServiceError as exc:
+                entry["positions"] = broker.get_positions()
+            except BrokerError as exc:
                 entry["error"] = str(exc)
         rows.append(entry)
     has_positions = any(r["positions"] for r in rows)
@@ -88,8 +125,9 @@ def positions(request):
 # -- strategies -------------------------------------------------------------
 @login_required
 def strategies(request):
+    market = current_market(request)
     if request.method == "POST":
-        form = StrategyConfigForm(request.POST, user=request.user)
+        form = StrategyConfigForm(request.POST, user=request.user, market=market)
         if form.is_valid():
             strategy = form.save()
             # Automatic setup: backfill -> evaluate -> switch ON -> trend-based entry.
@@ -102,12 +140,21 @@ def strategies(request):
                 messages.error(request, f"{strategy.symbol} created, but automatic start failed: {exc}")
             return redirect("trading:strategies")
     else:
-        form = StrategyConfigForm(user=request.user, initial={"short_window": 10, "long_window": 50})
-    items = StrategyConfig.objects.select_related("account").order_by("symbol", "name")
+        form = StrategyConfigForm(
+            user=request.user,
+            market=market,
+            initial={"short_window": 10, "long_window": 50, "trade_quantity": 100 if market == Market.TH else 1},
+        )
+    items = StrategyConfig.objects.filter(market=market).select_related("account").order_by("symbol", "name")
     return render(
         request,
         "trading/strategies.html",
-        {"strategies": items, "form": form, "multi_account": linked_accounts(request.user).count() > 1},
+        {
+            "strategies": items,
+            "form": form,
+            "multi_account": len(linked_accounts(request.user, market)) > 1,
+            "has_account": bool(linked_accounts(request.user, market)),
+        },
     )
 
 
@@ -130,7 +177,7 @@ def strategy_toggle(request, pk):
     strategy.save(update_fields=["is_active"])
     state = "ON" if strategy.is_active else "OFF"
     messages.info(request, f"Automated execution for '{strategy.name}' is now {state}.")
-    return redirect(request.POST.get("next") or "trading:strategies")
+    return redirect(_safe_next(request, "trading:strategies"))
 
 
 @login_required
@@ -153,7 +200,7 @@ def strategy_run(request, pk):
     except Exception as exc:
         logger.exception("Strategy run failed")
         messages.error(request, f"Run failed: {exc}")
-    return redirect(request.POST.get("next") or "trading:strategies")
+    return redirect(_safe_next(request, "trading:strategies"))
 
 
 @login_required
@@ -167,6 +214,8 @@ def strategy_chart(request, pk):
     data.update(
         {
             "symbol": strategy.symbol,
+            "market": strategy.market,
+            "currency": MARKET_SYMBOL[strategy.market],
             "ma_type": strategy.ma_type,
             "short_window": strategy.short_window,
             "long_window": strategy.long_window,
@@ -175,16 +224,69 @@ def strategy_chart(request, pk):
     return JsonResponse(data)
 
 
+# -- settings: brokerage accounts ----------------------------------------------
+@login_required
+def settings_page(request, pk=None):
+    market = current_market(request)
+    instance = None
+    if pk is not None:
+        instance = get_object_or_404(_user_accounts(request.user, Market.TH), pk=pk)
+    form = None
+    if market == Market.TH:
+        form = SettradeAccountForm(request.POST or None, instance=instance)
+        if request.method == "POST" and form.is_valid():
+            account = form.save(commit=False)
+            if not instance:
+                account.user = request.user
+            account.save()
+            mode = "sandbox" if account.is_paper else "LIVE"
+            messages.success(request, f"Saved Settrade account {account.account_id} ({mode}). Use Test to verify it.")
+            return redirect("trading:settings")
+    return render(
+        request,
+        "trading/settings.html",
+        {"accounts": _user_accounts(request.user, market), "form": form, "editing": instance},
+    )
+
+
+@login_required
+@require_POST
+def settrade_test(request, pk):
+    account = get_object_or_404(_user_accounts(request.user, Market.TH), pk=pk)
+    report = SettradeService(account).test_connection()
+    level = messages.SUCCESS if report["ok"] else messages.ERROR
+    messages.add_message(request, level, f"Settrade {account.account_id}: " + " · ".join(report["steps"]))
+    return redirect("trading:settings")
+
+
+@login_required
+@require_POST
+def account_delete(request, pk):
+    account = get_object_or_404(_user_accounts(request.user), pk=pk)
+    label = account.account_name or account.account_id or "account"
+    account.delete()
+    messages.info(request, f"Removed {label}. Strategies using it now have no account.")
+    return redirect("trading:settings")
+
+
 # -- brokerage onboarding (SnapTrade) ----------------------------------------
+def _snaptrade_or_none(request):
+    try:
+        return SnapTradeService()
+    except SnapTradeServiceError as exc:
+        messages.warning(request, str(exc))
+        return None
+
+
 @login_required
 @require_POST
 def connect_brokerage(request):
     """Register the user with SnapTrade (once) and redirect to the Connection Portal."""
-    service = _service_or_none(request)
+    service = _snaptrade_or_none(request)
     if service is None:
-        return redirect("trading:dashboard")
+        return redirect("trading:settings")
 
-    existing = BrokerageAccount.objects.filter(user=request.user).first()
+    existing = BrokerageAccount.objects.filter(user=request.user, provider=SNAPTRADE).first()
     try:
         if existing:
             user_id, user_secret = existing.snaptrade_user_id, existing.snaptrade_user_secret
@@ -193,6 +295,7 @@ def connect_brokerage(request):
             user_id, user_secret = creds["user_id"], creds["user_secret"]
             BrokerageAccount.objects.create(
                 user=request.user,
+                provider=SNAPTRADE,
                 snaptrade_user_id=user_id,
                 snaptrade_user_secret=user_secret,
                 brokerage_name="Alpaca",
@@ -204,7 +307,7 @@ def connect_brokerage(request):
         link = service.get_connection_link(user_id, user_secret, redirect_url=redirect_url)
     except SnapTradeServiceError as exc:
         messages.error(request, f"Could not start brokerage connection: {exc}")
-        return redirect("trading:dashboard")
+        return redirect("trading:settings")
     return redirect(link)
 
 
@@ -212,19 +315,19 @@ def connect_brokerage(request):
 def connect_callback(request):
     """SnapTrade redirects here after the user links Alpaca; sync the accounts."""
     _sync_accounts(request)
-    return redirect("trading:dashboard")
+    return redirect("trading:settings")
 
 
 @login_required
 @require_POST
 def sync_accounts(request):
     _sync_accounts(request)
-    return redirect(request.POST.get("next") or "trading:dashboard")
+    return redirect(_safe_next(request, "trading:settings"))
 
 
 def _sync_accounts(request):
-    service = _service_or_none(request)
-    creds = BrokerageAccount.objects.filter(user=request.user).first()
+    service = _snaptrade_or_none(request)
+    creds = BrokerageAccount.objects.filter(user=request.user, provider=SNAPTRADE).first()
     if service is None or creds is None:
         messages.warning(request, "No SnapTrade user registered yet. Click 'Connect Alpaca' first.")
         return
@@ -239,6 +342,7 @@ def _sync_accounts(request):
         for acc in remote:
             obj, created = BrokerageAccount.objects.update_or_create(
                 user=request.user,
+                provider=SNAPTRADE,
                 snaptrade_user_id=creds.snaptrade_user_id,
                 account_id=acc["id"],
                 defaults={
@@ -252,7 +356,7 @@ def _sync_accounts(request):
         if seen:
             # The placeholder row (registration only, no account yet) is no longer needed.
             BrokerageAccount.objects.filter(
-                user=request.user, snaptrade_user_id=creds.snaptrade_user_id, account_id=""
+                user=request.user, provider=SNAPTRADE, snaptrade_user_id=creds.snaptrade_user_id, account_id=""
             ).delete()
     if remote:
         messages.success(request, f"Synced {len(remote)} brokerage account(s).")

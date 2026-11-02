@@ -5,14 +5,17 @@ from django.contrib import admin, messages
 from django.shortcuts import redirect, render
 from django.urls import path, reverse
 
-from services.massive_service import MassiveAPIError, fetch_historical_data
+from services.errors import MarketDataError
+from services.market_data import backfill
+from services.massive_service import fetch_historical_data
 from services.momentum_strategy import run_strategy, start_strategy
 
 from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
 
 
 class BackfillForm(forms.Form):
-    symbol = forms.CharField(max_length=16, help_text="Ticker, e.g. AAPL")
+    market = forms.ChoiceField(choices=[("US", "US (Massive)"), ("TH", "TH (Settrade, daily only)")], initial="US")
+    symbol = forms.CharField(max_length=16, help_text="Ticker, e.g. AAPL or PTT")
     start_date = forms.DateField(initial=lambda: date.today() - timedelta(days=365))
     end_date = forms.DateField(initial=date.today)
     timespan = forms.ChoiceField(
@@ -21,40 +24,42 @@ class BackfillForm(forms.Form):
     multiplier = forms.IntegerField(min_value=1, initial=1)
 
 
-def _backfill(modeladmin, request, symbols, days=365):
+def _backfill(modeladmin, request, pairs, days=365):
+    """pairs: iterable of (market, symbol)."""
     end = date.today()
     start = end - timedelta(days=days)
-    for symbol in sorted(set(symbols)):
+    for market, symbol in sorted(set(pairs)):
         try:
-            s = fetch_historical_data(symbol, start, end)
+            s = backfill(market, symbol, start, end)
             modeladmin.message_user(
-                request, f"{s['symbol']}: {s['created']} new candles ({s['skipped']} already stored)."
+                request, f"{market}:{s['symbol']}: {s['created']} new candles ({s['skipped']} already stored)."
             )
-        except MassiveAPIError as exc:
+        except MarketDataError as exc:
             modeladmin.message_user(request, f"{symbol}: backfill failed - {exc}", messages.ERROR)
 
 
 @admin.register(BrokerageAccount)
 class BrokerageAccountAdmin(admin.ModelAdmin):
-    list_display = ("user", "brokerage_name", "account_name", "account_id", "is_paper", "created_at")
-    list_filter = ("brokerage_name", "is_paper")
+    list_display = ("user", "provider", "brokerage_name", "account_name", "account_id", "is_paper", "created_at")
+    list_filter = ("provider", "is_paper")
     search_fields = ("user__username", "account_id", "account_name", "snaptrade_user_id")
     readonly_fields = ("created_at",)
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
         # Don't echo the SnapTrade secret back in the page.
-        form.base_fields["snaptrade_user_secret"].widget = forms.PasswordInput(render_value=True)
+        for name in ("snaptrade_user_secret", "settrade_app_secret", "settrade_app_code", "settrade_pin"):
+            form.base_fields[name].widget = forms.PasswordInput(render_value=True)
         return form
 
 
 @admin.register(StockData)
 class StockDataAdmin(admin.ModelAdmin):
-    list_display = ("symbol", "timestamp", "open_price", "high_price", "low_price", "close_price", "volume")
-    list_filter = ("symbol",)
+    list_display = ("market", "symbol", "timestamp", "open_price", "high_price", "low_price", "close_price", "volume")
+    list_filter = ("market", "symbol")
     search_fields = ("symbol",)
     date_hierarchy = "timestamp"
-    ordering = ("symbol", "-timestamp")
+    ordering = ("market", "symbol", "-timestamp")
     actions = ["backfill_symbols"]
     change_list_template = "admin/trading/stockdata/change_list.html"
 
@@ -73,16 +78,19 @@ class StockDataAdmin(admin.ModelAdmin):
         if request.method == "POST" and form.is_valid():
             d = form.cleaned_data
             try:
-                s = fetch_historical_data(
-                    d["symbol"], d["start_date"], d["end_date"],
-                    timespan=d["timespan"], multiplier=d["multiplier"],
-                )
+                if d["market"] == "TH":
+                    s = backfill("TH", d["symbol"], d["start_date"], d["end_date"])
+                else:
+                    s = fetch_historical_data(
+                        d["symbol"], d["start_date"], d["end_date"],
+                        timespan=d["timespan"], multiplier=d["multiplier"],
+                    )
                 self.message_user(
                     request,
                     f"{s['symbol']}: fetched {s['fetched']}, created {s['created']}, skipped {s['skipped']}.",
                 )
                 return redirect(reverse("admin:trading_stockdata_changelist") + f"?symbol={s['symbol']}")
-            except MassiveAPIError as exc:
+            except MarketDataError as exc:
                 self.message_user(request, f"Backfill failed: {exc}", messages.ERROR)
         context = {
             **self.admin_site.each_context(request),
@@ -94,16 +102,16 @@ class StockDataAdmin(admin.ModelAdmin):
 
     @admin.action(description="Backfill last 365 days for selected symbols")
     def backfill_symbols(self, request, queryset):
-        _backfill(self, request, queryset.values_list("symbol", flat=True).distinct())
+        _backfill(self, request, queryset.values_list("market", "symbol").distinct())
 
 
 @admin.register(StrategyConfig)
 class StrategyConfigAdmin(admin.ModelAdmin):
     list_display = (
-        "name", "symbol", "is_active", "ma_type", "short_window", "long_window",
+        "name", "market", "symbol", "is_active", "ma_type", "short_window", "long_window",
         "account", "trade_quantity", "last_signal", "trend", "last_run",
     )
-    list_filter = ("is_active", "ma_type", "symbol")
+    list_filter = ("market", "is_active", "ma_type")
     list_editable = ("is_active",)
     search_fields = ("name", "symbol")
     readonly_fields = ("last_run", "last_signal", "trend", "last_signal_bar")
@@ -140,7 +148,7 @@ class StrategyConfigAdmin(admin.ModelAdmin):
 
     @admin.action(description="Backfill last 365 days of data for selected strategies")
     def backfill_selected(self, request, queryset):
-        _backfill(self, request, queryset.values_list("symbol", flat=True))
+        _backfill(self, request, queryset.values_list("market", "symbol"))
 
     @admin.action(description="Activate selected strategies")
     def activate(self, request, queryset):

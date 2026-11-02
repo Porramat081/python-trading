@@ -130,6 +130,10 @@ SNAPTRADE_REDIRECT_URL = os.getenv("SNAPTRADE_REDIRECT_URL", "")
 # "commercial" (standard partner keys) or "personal" (SnapTrade personal API keys)
 SNAPTRADE_KEY_TYPE = os.getenv("SNAPTRADE_KEY_TYPE", "commercial").strip().lower()
 
+# Settrade Open API (Thai stocks). Credentials are entered on the Settings page and stored
+# encrypted with this key (a Fernet key). If empty, a key derived from DJANGO_SECRET_KEY is used.
+FIELD_ENCRYPTION_KEY = os.getenv("FIELD_ENCRYPTION_KEY", "")
+
 # --- Trading safety switches -------------------------------------------
 # TRADING_ENABLED=False -> signals are computed and logged but no orders are sent.
 TRADING_ENABLED = env_bool("TRADING_ENABLED", False)
