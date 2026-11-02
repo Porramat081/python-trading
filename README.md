@@ -16,6 +16,7 @@ A private Django trading bot that:
 
 ```text
 manage.py
+run.py                       # one-command launcher: migrate + web server + scheduler
 algo_trader/                 # project config (settings, urls, wsgi/asgi)
 trading/                     # main app: models, views, admin, templates, management commands
   management/commands/
@@ -62,6 +63,16 @@ python manage.py createsuperuser
 ```bash
 python manage.py runserver
 ```
+
+**Or start everything with one command.** This runs the migrations, the web server and the scheduler together
+(Ctrl+C stops both):
+
+```bash
+python run.py
+```
+
+Options: `--port 8080`, `--interval 5`, `--ignore-market-hours`, `--no-scheduler`. The script uses `.venv`
+automatically, even if it isn't activated.
 
 Open http://127.0.0.1:8000, log in, and click **Connect Alpaca**. This registers you with SnapTrade and sends you
 to the SnapTrade Connection Portal. When you finish, SnapTrade redirects you to `/accounts/connect/callback/`,
