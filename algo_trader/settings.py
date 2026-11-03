@@ -103,7 +103,9 @@ AUTH_PASSWORD_VALIDATORS = [
 ]
 
 LANGUAGE_CODE = "en-us"
-TIME_ZONE = "UTC"
+# Times are shown in the stock market's own time zone (US Eastern, with daylight saving).
+# Override with DJANGO_TIME_ZONE if needed. The database still stores UTC.
+TIME_ZONE = os.getenv("DJANGO_TIME_ZONE", "America/New_York")
 USE_I18N = True
 USE_TZ = True
 
@@ -130,6 +132,10 @@ SNAPTRADE_REDIRECT_URL = os.getenv("SNAPTRADE_REDIRECT_URL", "")
 # "commercial" (standard partner keys) or "personal" (SnapTrade personal API keys)
 SNAPTRADE_KEY_TYPE = os.getenv("SNAPTRADE_KEY_TYPE", "commercial").strip().lower()
 
+# --- US market hours (header clock + scheduler), in TIME_ZONE local time --------
+MARKET_OPEN_TIME = "09:30"
+MARKET_CLOSE_TIME = "16:00"
+
 # --- Trading safety switches -------------------------------------------
 # TRADING_ENABLED=False -> signals are computed and logged but no orders are sent.
 TRADING_ENABLED = env_bool("TRADING_ENABLED", False)
@@ -142,7 +148,12 @@ SNAPTRADE_BROKER_SLUG = "ALPACA" if LIVE_TRADING else "ALPACA-PAPER"
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
-    "formatters": {"simple": {"format": "%(asctime)s %(levelname)s %(name)s: %(message)s"}},
+    "formatters": {
+        "simple": {
+            "format": "%(asctime)s %(levelname)s %(name)s: %(message)s",
+            "datefmt": "%Y-%m-%d %H:%M:%S %Z",  # e.g. 2026-11-03 10:15:00 EST
+        }
+    },
     "handlers": {"console": {"class": "logging.StreamHandler", "formatter": "simple"}},
     "loggers": {
         "services": {"handlers": ["console"], "level": "INFO"},

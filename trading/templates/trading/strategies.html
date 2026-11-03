@@ -33,7 +33,7 @@
       <td class="{% if s.last_signal == 'BUY' %}up{% elif s.last_signal == 'SELL' %}down{% else %}muted{% endif %}">{{ s.last_signal|default:"—" }}</td>
       <td class="num">{{ s.trade_quantity|floatformat:"-4" }}</td>
       {% if multi_account %}<td class="muted">{{ s.account.account_name|default:"—" }}</td>{% endif %}
-      <td class="muted">{% if s.last_run %}{{ s.last_run|timesince }} ago{% else %}never{% endif %}</td>
+      <td class="muted" {% if s.last_run %}title="{{ s.last_run|date:'Y-m-d H:i:s T' }}"{% endif %}>{% if s.last_run %}{{ s.last_run|timesince }} ago{% else %}never{% endif %}</td>
       <td>
         <form method="post" action="{% url 'trading:strategy_toggle' s.pk %}" class="inline">{% csrf_token %}
           <button class="switch {% if s.is_active %}on{% endif %}" title="Automatic trading {% if s.is_active %}ON{% else %}OFF{% endif %}" aria-label="Toggle"></button>

@@ -2,18 +2,20 @@ import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
+from django.conf import settings
 from django.core.management.base import BaseCommand
 
 from services.momentum_strategy import refresh_and_run_active
 
 NY = ZoneInfo("America/New_York")
-MARKET_OPEN = dtime(9, 30)
-MARKET_CLOSE = dtime(16, 0)
+MARKET_OPEN = dtime.fromisoformat(settings.MARKET_OPEN_TIME)
+MARKET_CLOSE = dtime.fromisoformat(settings.MARKET_CLOSE_TIME)
 AFTER_CLOSE = dtime(16, 10)  # daily candle is final shortly after the close
 
 
 def market_is_open(now: datetime) -> bool:
     """Regular US session, Mon-Fri 09:30-16:00 New York time (exchange holidays not included)."""
+    now = now.astimezone(NY)
     return now.weekday() < 5 and MARKET_OPEN <= now.time() < MARKET_CLOSE
 
 

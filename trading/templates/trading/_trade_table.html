@@ -1,10 +1,10 @@
 <div class="scroll">
 <table>
-  <thead><tr><th>Time</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th>Note</th></tr></thead>
+  <thead><tr><th>Time (ET)</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th>Note</th></tr></thead>
   <tbody>
   {% for t in trades %}
     <tr>
-      <td class="muted">{{ t.created_at|date:"M j, H:i" }}</td>
+      <td class="muted" title="{{ t.created_at|date:'Y-m-d H:i:s T' }}">{{ t.created_at|date:"M j, H:i T" }}</td>
       <td><strong>{{ t.symbol }}</strong></td>
       <td class="{% if t.action == 'BUY' %}up{% else %}down{% endif %}">{{ t.action }}</td>
       <td class="num">{{ t.quantity|floatformat:"-4" }}</td>

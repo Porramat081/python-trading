@@ -36,7 +36,7 @@
     {{ selected_strategy.ma_type }} {{ selected_strategy.short_window }}/{{ selected_strategy.long_window }}
     {% if selected_strategy.trend %}· trend <span class="{{ selected_strategy.trend|lower }}">{% if selected_strategy.trend == 'UP' %}▲ up{% else %}▼ down{% endif %}</span>{% endif %}
     {% if selected_strategy.last_signal %}· signal {{ selected_strategy.last_signal }}{% endif %}
-    {% if selected_strategy.last_run %}· checked {{ selected_strategy.last_run|timesince }} ago{% endif %}
+    {% if selected_strategy.last_run %}· checked {{ selected_strategy.last_run|date:"M j, H:i T" }}{% endif %}
   </p>
   {% if candle_count %}<div class="chart"><canvas id="priceChart"></canvas></div>
   {% else %}<p class="muted">No price data yet — it is fetched automatically on the next run.</p>{% endif %}

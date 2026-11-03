@@ -7,6 +7,14 @@
   <link rel="stylesheet" href="{% static 'trading/style.css' %}">
 </head>
 <body>
+<div class="clockbar">
+  <div id="mkt-clock" class="clock" data-tz="America/New_York" data-open="{{ MARKET_OPEN_TIME }}" data-close="{{ MARKET_CLOSE_TIME }}"
+       title="US stock market (NYSE/Nasdaq), New York time. Regular session {{ MARKET_OPEN_TIME }}–{{ MARKET_CLOSE_TIME }} Mon–Fri; holidays not shown.">
+    <span class="dot"></span>
+    <span class="clock-time">{% now "D H:i T" %}</span>
+    <span class="clock-status">US market hours {{ MARKET_OPEN_TIME }}–{{ MARKET_CLOSE_TIME }} ET</span>
+  </div>
+</div>
 <header class="bar">
   <a class="brand" href="{% url 'trading:dashboard' %}">Algo Trader</a>
   {% if user.is_authenticated %}
@@ -31,6 +39,7 @@
   {% for message in messages %}<p class="flash {{ message.tags }}">{{ message }}</p>{% endfor %}
   {% block content %}{% endblock %}
 </main>
+<script src="{% static 'trading/clock.js' %}"></script>
 {% block scripts %}{% endblock %}
 </body>
 </html>

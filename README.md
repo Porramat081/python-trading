@@ -167,6 +167,16 @@ Each crossover candle is acted on only once (`StrategyConfig.last_signal_bar`), 
 won't duplicate orders. Every attempt is recorded in `TradeLog` with one of these statuses: `PENDING`, `EXECUTED`,
 `FAILED`, or `SKIPPED` (dry run / nothing to sell).
 
+### Time zone
+
+All times in the app are shown in **US Eastern time** (New York, the stock market's own time zone). This
+covers the trade log, "last checked" times, chart dates, the admin and log lines. Daylight saving (EST/EDT) is
+handled automatically. The database still stores UTC. To use another zone, set `DJANGO_TIME_ZONE` in `.env`.
+
+The bar at the top of every page shows a live **US market clock**: the New York time, and whether the market
+is open, in pre-market (04:00–09:30), after hours (16:00–20:00) or closed, with a countdown to the next open or
+close. Exchange holidays aren't included.
+
 ### Error handling
 
 - **Massive:** retries on HTTP 429 and 5xx, honouring `Retry-After` with exponential backoff, and follows `next_url`

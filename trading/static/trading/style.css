@@ -75,3 +75,12 @@ td.note { white-space: normal; color: var(--muted); font-size: 12px; max-width: 
 .stack label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
 .login { max-width: 320px; margin: 64px auto; }
 .login p { display: grid; gap: 4px; margin: 0 0 12px; } .login input { width: 100%; }
+
+/* US market clock */
+.clockbar { background: var(--soft); border-bottom: 1px solid var(--line); }
+.clock { max-width: 1040px; margin: 0 auto; padding: 6px 16px; display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.clock-time { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+.clock .dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; }
+.clock[data-state="open"] .dot { background: var(--up); box-shadow: 0 0 0 3px #d1fae5; }
+.clock[data-state="open"] .clock-status { color: var(--up); }
+.clock[data-state="pre"] .dot, .clock[data-state="after"] .dot { background: var(--warn); }

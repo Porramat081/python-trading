@@ -404,3 +404,44 @@ class BackfillRefreshTests(TestCase):
         fetch_historical_data("AAPL", "2025-01-01", "2025-01-01", client=client)
         row = StockData.objects.get()
         self.assertEqual((row.close_price, row.volume), (Decimal("2.5"), 99))
+
+
+class TimeZoneTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("tz", password="pw-123456")
+        self.client.force_login(self.user)
+
+    def test_times_shown_in_us_eastern(self):
+        from django.conf import settings
+        from django.utils import timezone as dj_tz
+
+        self.assertEqual(settings.TIME_ZONE, "America/New_York")
+        account = BrokerageAccount.objects.create(
+            user=self.user, snaptrade_user_id="u", snaptrade_user_secret="s", account_id="a"
+        )
+        log = TradeLog.objects.create(account=account, symbol="AAPL", action="BUY", quantity=1, status="SKIPPED")
+        # 15:00 UTC on a winter day is 10:00 EST.
+        TradeLog.objects.filter(pk=log.pk).update(created_at=datetime(2026, 1, 15, 15, 0, tzinfo=dt_tz.utc))
+        with mock.patch("trading.views.SnapTradeService", side_effect=SnapTradeServiceError("no keys")):
+            html = self.client.get(reverse("trading:dashboard")).content.decode()
+        self.assertIn("Jan 15, 10:00 EST", html)
+        self.assertIn('id="mkt-clock"', html)
+        self.assertEqual(str(dj_tz.get_current_timezone()), "America/New_York")
+
+    def test_chart_labels_in_eastern(self):
+        # Massive daily bars are stamped at midnight New York time (05:00 UTC in winter).
+        StockData.objects.bulk_create(
+            StockData(symbol="SPY", timestamp=datetime(2026, 1, 5, 5, 0, tzinfo=dt_tz.utc) + timedelta(days=i),
+                      open_price=1, high_price=1, low_price=1, close_price=100 + i, volume=1)
+            for i in range(15)
+        )
+        strategy = StrategyConfig.objects.create(name="s", symbol="SPY", short_window=3, long_window=10)
+        labels = self.client.get(reverse("trading:strategy_chart", args=[strategy.pk])).json()["labels"]
+        self.assertEqual(labels[0], "2026-01-05T00:00:00-05:00")
+
+    def test_scheduler_converts_to_new_york(self):
+        from trading.management.commands.run_scheduler import market_is_open
+
+        # 14:45 UTC on a Monday = 09:45 EST (open); 14:15 UTC = 09:15 EST (not yet open).
+        self.assertTrue(market_is_open(datetime(2026, 11, 2, 14, 45, tzinfo=dt_tz.utc)))
+        self.assertFalse(market_is_open(datetime(2026, 11, 2, 14, 15, tzinfo=dt_tz.utc)))

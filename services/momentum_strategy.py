@@ -104,7 +104,9 @@ def chart_data(strategy, limit: int = 300) -> dict:
     def clean(series):
         return [None if pd.isna(v) else round(float(v), 4) for v in series]
 
-    labels = [ts.isoformat() for ts in df.index]
+    # Show candle times in the market's time zone (settings.TIME_ZONE, US Eastern by default).
+    tz = timezone.get_current_timezone()
+    labels = [ts.tz_convert(tz).isoformat() if ts.tzinfo else ts.isoformat() for ts in df.index]
     signals = [
         {"x": labels[i], "y": float(row.close), "signal": row.signal}
         for i, row in enumerate(df.itertuples())
