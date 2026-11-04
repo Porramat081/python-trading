@@ -1,8 +1,8 @@
 #!/usr/bin/env python
 """Start everything with one command: migrate, then the web server + strategy scheduler.
 
-    python run.py                      # http://127.0.0.1:8000, scheduler every 15 min
-    python run.py --port 8080 --interval 5
+    python run.py                      # http://127.0.0.1:8000, day-trading loop per Strategy settings
+    python run.py --port 8080 --interval 1
     python run.py --no-scheduler       # web server only
 
 Ctrl+C stops both processes. If either one exits, the other is stopped too.
@@ -45,7 +45,9 @@ def main():
     parser = argparse.ArgumentParser(description="Run the Algo Trader web server and scheduler together.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", default="8000")
-    parser.add_argument("--interval", type=int, default=15, help="Scheduler minutes between runs (default 15).")
+    parser.add_argument(
+        "--interval", type=int, help="Override minutes between day-trading loops (default: Strategy settings)."
+    )
     parser.add_argument("--ignore-market-hours", action="store_true", help="Scheduler runs 24/7.")
     parser.add_argument("--no-scheduler", action="store_true", help="Start only the web server.")
     parser.add_argument("--skip-migrate", action="store_true")
@@ -62,7 +64,9 @@ def main():
 
     commands = {"web": (manage("runserver", f"{opts.host}:{opts.port}", "--noreload"), "36")}
     if not opts.no_scheduler:
-        sched = manage("run_scheduler", "--interval", str(opts.interval))
+        sched = manage("run_scheduler")
+        if opts.interval:
+            sched += ["--interval", str(opts.interval)]
         if opts.ignore_market_hours:
             sched.append("--ignore-market-hours")
         commands["scheduler"] = (sched, "35")

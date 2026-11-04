@@ -1,0 +1,35 @@
+{% extends "trading/base.html" %}
+{% block title %}Strategy · Algo Trader{% endblock %}
+{% block content %}
+<h1>Day-trading strategy</h1>
+<p class="muted small">
+  Daily 50 SMA macro filter · {{ cfg.timeframe_minutes }}-min 9/21 EMA cross · RSI 14 (45–65) · MACD 12/26/9 ·
+  no overnight holdings. {% if not TRADING_ENABLED %}<b>Dry run:</b> fills are simulated, nothing is sent to the broker.{% endif %}
+</p>
+
+<div class="actions">
+  <form method="post" action="{% url 'trading:toggle_auto' %}" class="inline">{% csrf_token %}<input type="hidden" name="next" value="{% url 'trading:strategy' %}">
+    <button class="btn {% if not cfg.auto_trading %}dark{% endif %}">{% if cfg.auto_trading %}Turn auto OFF{% else %}Turn auto ON{% endif %}</button></form>
+  <form method="post" action="{% url 'trading:scan_now' %}" class="inline">{% csrf_token %}<button class="btn">Scan now</button></form>
+  <form method="post" action="{% url 'trading:run_now' %}" class="inline">{% csrf_token %}<button class="btn" title="Run one monitoring loop now, even outside market hours">Run loop now</button></form>
+  <form method="post" action="{% url 'trading:liquidate_now' %}" class="inline" onsubmit="return confirm('Sell ALL bot positions now at market?');">{% csrf_token %}<button class="btn err">Close all now</button></form>
+</div>
+<p class="muted small">Last scan: {{ cfg.last_scan_at|date:"M j, H:i T"|default:"never" }} · last loop: {{ cfg.last_cycle_at|date:"M j, H:i T"|default:"never" }}</p>
+
+<form method="post" class="settings">{% csrf_token %}
+  {{ form.non_field_errors }}
+  <h2>Execution &amp; risk</h2>
+  <div class="grid2">
+    {% for field in form %}{% if field.name not in "screener_source screener_count min_price max_price min_volume" %}
+      <label>{{ field.label }} {{ field }} {{ field.errors }}</label>
+    {% endif %}{% endfor %}
+  </div>
+  <h2>Screener (New Stock List)</h2>
+  <div class="grid2">
+    {% for field in form %}{% if field.name in "screener_source screener_count min_price max_price min_volume" %}
+      <label>{{ field.label }} {{ field }} {{ field.errors }}</label>
+    {% endif %}{% endfor %}
+  </div>
+  <p style="margin-top:16px"><button class="btn dark">Save settings</button></p>
+</form>
+{% endblock %}

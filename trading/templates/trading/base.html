@@ -21,8 +21,8 @@
   {% with n=request.resolver_match.url_name %}
   <nav>
     <a href="{% url 'trading:dashboard' %}" {% if n == 'dashboard' %}class="on"{% endif %}>Dashboard</a>
-    <a href="{% url 'trading:positions' %}" {% if n == 'positions' %}class="on"{% endif %}>Positions</a>
-    <a href="{% url 'trading:strategies' %}" {% if 'strateg' in n %}class="on"{% endif %}>Strategies</a>
+    <a href="{% url 'trading:strategy' %}" {% if n == 'strategy' %}class="on"{% endif %}>Strategy</a>
+    <a href="{% url 'trading:positions' %}" {% if n == 'positions' %}class="on"{% endif %}>Broker positions</a>
   </nav>
   {% endwith %}
   <div class="end">

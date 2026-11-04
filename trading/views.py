@@ -1,18 +1,24 @@
 import logging
+from datetime import datetime, time as dtime, timedelta
+
+import pandas as pd
 from django.conf import settings
 from django.contrib import messages
 from django.contrib.auth.decorators import login_required
 from django.db import transaction
+from django.db.models import Q
 from django.http import JsonResponse
 from django.shortcuts import get_object_or_404, redirect, render
 from django.urls import reverse
+from django.utils import timezone
 from django.views.decorators.http import require_POST
 
-from services.momentum_strategy import chart_data, run_strategy, start_strategy
+from services import indicators as ind
+from services.daytrader import NEW_YORK, DayTrader, MassiveData
 from services.snaptrade_service import SnapTradeService, SnapTradeServiceError
 
-from .forms import StrategyConfigForm, linked_accounts
-from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
+from .forms import DayTradeSettingsForm
+from .models import BrokerageAccount, DayTradeSettings, ObserveItem, Position, ScanResult, TradeLog
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +36,20 @@ def _service_or_none(request):
         return None
 
 
+def _today_start():
+    """Midnight New York time today (as an aware datetime)."""
+    now = timezone.now().astimezone(NEW_YORK)
+    return datetime.combine(now.date(), dtime.min, tzinfo=NEW_YORK)
+
+
 @login_required
 def dashboard(request):
+    cfg = DayTradeSettings.load()
     accounts = list(_user_accounts(request.user))
     linked = [a for a in accounts if a.is_linked]
     service = _service_or_none(request) if linked else None
 
-    account_cards = []
-    total_value = 0.0
+    account_cards, total_value = [], 0.0
     for account in linked:
         card = {"account": account, "balance": None, "error": None}
         if service:
@@ -50,18 +62,41 @@ def dashboard(request):
                 card["error"] = str(exc)
         account_cards.append(card)
 
-    strategies = list(StrategyConfig.objects.select_related("account").order_by("name"))
-    selected_id = request.GET.get("strategy")
-    selected = next((s for s in strategies if str(s.pk) == selected_id), strategies[0] if strategies else None)
+    today = _today_start()
+    open_positions = list(Position.objects.filter(status__in=["PENDING", "OPEN"]))
+    closed_today = list(Position.objects.filter(status="CLOSED", closed_at__gte=today))
+    realized = sum(p.pnl or 0 for p in closed_today)
+    unrealized = sum(p.pnl or 0 for p in open_positions)
+
+    observe = []
+    held = {p.symbol for p in open_positions}
+    for item in ObserveItem.objects.all():
+        owned = item.symbol in held
+        expires = None if owned else item.added_at + timedelta(minutes=cfg.observe_minutes)
+        observe.append({"item": item, "owned": owned, "expires": expires})
+
+    last_scan = ScanResult.objects.order_by("-scanned_at").first()
+    scan_rows = (
+        ScanResult.objects.filter(scanned_at__gte=last_scan.scanned_at - timedelta(minutes=5)) if last_scan else []
+    )
+    chart_symbols = sorted(held | {o["item"].symbol for o in observe})
+    selected = request.GET.get("symbol") or (chart_symbols[0] if chart_symbols else "")
 
     context = {
+        "cfg": cfg,
         "account_cards": account_cards,
         "has_pending_registration": any(not a.is_linked for a in accounts),
         "total_value": total_value,
-        "recent_trades": TradeLog.objects.filter(account__in=accounts).select_related("account", "strategy")[:10],
-        "strategies": strategies,
-        "selected_strategy": selected,
-        "candle_count": StockData.objects.filter(symbol=selected.symbol).count() if selected else 0,
+        "open_positions": open_positions,
+        "closed_today": closed_today,
+        "realized": realized,
+        "unrealized": unrealized,
+        "observe": observe,
+        "scan_rows": scan_rows,
+        "last_scan": last_scan,
+        "recent_trades": TradeLog.objects.select_related("position")[:12],
+        "chart_symbols": chart_symbols,
+        "selected_symbol": selected.upper(),
     }
     return render(request, "trading/dashboard.html", context)
 
@@ -85,94 +120,118 @@ def positions(request):
     return render(request, "trading/positions.html", {"rows": rows, "has_positions": has_positions})
 
 
-# -- strategies -------------------------------------------------------------
+# -- strategy settings & actions ----------------------------------------------------
 @login_required
-def strategies(request):
-    if request.method == "POST":
-        form = StrategyConfigForm(request.POST, user=request.user)
-        if form.is_valid():
-            strategy = form.save()
-            # Automatic setup: backfill -> evaluate -> switch ON -> trend-based entry.
-            try:
-                result = start_strategy(strategy)
-                level = messages.ERROR if result.trade_status == "FAILED" else messages.SUCCESS
-                messages.add_message(request, level, f"{strategy.symbol}: {result.signal} · {result.message}")
-            except Exception as exc:
-                logger.exception("Strategy start failed")
-                messages.error(request, f"{strategy.symbol} created, but automatic start failed: {exc}")
-            return redirect("trading:strategies")
-    else:
-        form = StrategyConfigForm(user=request.user, initial={"short_window": 10, "long_window": 50})
-    items = StrategyConfig.objects.select_related("account").order_by("symbol", "name")
-    return render(
-        request,
-        "trading/strategies.html",
-        {"strategies": items, "form": form, "multi_account": linked_accounts(request.user).count() > 1},
-    )
-
-
-@login_required
-def strategy_edit(request, pk):
-    strategy = get_object_or_404(StrategyConfig, pk=pk)
-    form = StrategyConfigForm(request.POST or None, instance=strategy, user=request.user)
+def strategy(request):
+    cfg = DayTradeSettings.load()
+    form = DayTradeSettingsForm(request.POST or None, instance=cfg, user=request.user)
     if request.method == "POST" and form.is_valid():
         form.save()
-        messages.success(request, f"Strategy '{strategy.name}' updated.")
-        return redirect("trading:strategies")
-    return render(request, "trading/strategy_edit.html", {"form": form, "strategy": strategy})
+        messages.success(request, "Strategy settings saved.")
+        return redirect("trading:strategy")
+    return render(request, "trading/strategy.html", {"form": form, "cfg": cfg})
+
+
+def _report(request, report, title):
+    lines = report.actions or ["No actions."]
+    messages.info(request, f"{title}: " + " · ".join(lines)[:1500])
 
 
 @login_required
 @require_POST
-def strategy_toggle(request, pk):
-    strategy = get_object_or_404(StrategyConfig, pk=pk)
-    strategy.is_active = not strategy.is_active
-    strategy.save(update_fields=["is_active"])
-    state = "ON" if strategy.is_active else "OFF"
-    messages.info(request, f"Automated execution for '{strategy.name}' is now {state}.")
-    return redirect(request.POST.get("next") or "trading:strategies")
+def toggle_auto(request):
+    cfg = DayTradeSettings.load()
+    cfg.auto_trading = not cfg.auto_trading
+    cfg.save(update_fields=["auto_trading"])
+    messages.info(request, f"Automatic day trading is now {'ON' if cfg.auto_trading else 'OFF'}.")
+    return redirect(request.POST.get("next") or "trading:dashboard")
 
 
 @login_required
 @require_POST
-def strategy_delete(request, pk):
-    strategy = get_object_or_404(StrategyConfig, pk=pk)
-    strategy.delete()
-    messages.info(request, f"Strategy '{strategy.name}' deleted.")
-    return redirect("trading:strategies")
-
-
-@login_required
-@require_POST
-def strategy_run(request, pk):
-    strategy = get_object_or_404(StrategyConfig.objects.select_related("account"), pk=pk)
+def scan_now(request):
+    trader = DayTrader()
     try:
-        result = run_strategy(strategy, execute=True)
-        level = messages.ERROR if result.trade_status == "FAILED" else messages.SUCCESS
-        messages.add_message(request, level, str(result))
+        trader.scan()
     except Exception as exc:
-        logger.exception("Strategy run failed")
-        messages.error(request, f"Run failed: {exc}")
-    return redirect(request.POST.get("next") or "trading:strategies")
+        logger.exception("Scan failed")
+        messages.error(request, f"Scan failed: {exc}")
+    else:
+        _report(request, trader.report, "Scan")
+    return redirect(request.POST.get("next") or "trading:dashboard")
 
 
 @login_required
-def strategy_chart(request, pk):
-    strategy = get_object_or_404(StrategyConfig, pk=pk)
+@require_POST
+def run_now(request):
+    trader = DayTrader()
     try:
-        limit = min(int(request.GET.get("limit", 250)), 2000)
-    except ValueError:
-        limit = 250
-    data = chart_data(strategy, limit=limit)
-    data.update(
+        trader.run_cycle(force=True)
+    except Exception as exc:
+        logger.exception("Cycle failed")
+        messages.error(request, f"Loop failed: {exc}")
+    else:
+        _report(request, trader.report, "Loop")
+    return redirect(request.POST.get("next") or "trading:dashboard")
+
+
+@login_required
+@require_POST
+def liquidate_now(request):
+    trader = DayTrader()
+    trader.liquidate_all(reason="MANUAL")
+    _report(request, trader.report, "Close all")
+    return redirect(request.POST.get("next") or "trading:dashboard")
+
+
+@login_required
+@require_POST
+def position_close(request, pk):
+    pos = get_object_or_404(Position, pk=pk, status="OPEN")
+    trader = DayTrader()
+    trader.exit(pos, "MANUAL", "Closed from dashboard")
+    _report(request, trader.report, pos.symbol)
+    return redirect("trading:dashboard")
+
+
+@login_required
+@require_POST
+def observe_remove(request, pk):
+    item = get_object_or_404(ObserveItem, pk=pk)
+    item.delete()
+    messages.info(request, f"{item.symbol} removed from observe list.")
+    return redirect("trading:dashboard")
+
+
+@login_required
+def chart(request, symbol):
+    """5/15-min closes with 9/21 EMA for the dashboard chart (fetched live from Massive)."""
+    cfg = DayTradeSettings.load()
+    try:
+        bars = MassiveData().intraday(symbol.upper(), cfg.timeframe_minutes, timezone.now())
+    except Exception as exc:
+        return JsonResponse({"error": str(exc)}, status=502)
+    closes = bars.closed.tail(200)
+    if closes.empty:
+        return JsonResponse({"labels": [], "close": [], "ema_fast": [], "ema_slow": [], "symbol": symbol.upper()})
+    frame = ind.compute_frame(bars.closed).tail(len(closes))
+    tz = timezone.get_current_timezone()
+
+    def clean(series):
+        return [None if pd.isna(v) else round(float(v), 4) for v in series]
+
+    return JsonResponse(
         {
-            "symbol": strategy.symbol,
-            "ma_type": strategy.ma_type,
-            "short_window": strategy.short_window,
-            "long_window": strategy.long_window,
+            "symbol": symbol.upper(),
+            "timeframe": cfg.timeframe_minutes,
+            "labels": [ts.astimezone(tz).strftime("%m-%d %H:%M") for ts in frame.index],
+            "close": clean(frame["close"]),
+            "ema_fast": clean(frame["ema_fast"]),
+            "ema_slow": clean(frame["ema_slow"]),
+            "rsi": clean(frame["rsi"]),
+            "macd_hist": clean(frame["macd_hist"]),
         }
     )
-    return JsonResponse(data)
 
 
 # -- brokerage onboarding (SnapTrade) ----------------------------------------

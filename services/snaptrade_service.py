@@ -14,17 +14,11 @@ from django.conf import settings
 logger = logging.getLogger(__name__)
 
 
-class SnapTradeServiceError(Exception):
+from services.errors import BrokerError, TradingDisabledError  # noqa: E402,F401 (re-exported)
+
+
+class SnapTradeServiceError(BrokerError):
     """Raised for configuration problems or errors returned by SnapTrade / the brokerage."""
-
-    def __init__(self, message: str, status: int | None = None, body: Any = None):
-        super().__init__(message)
-        self.status = status
-        self.body = body
-
-
-class TradingDisabledError(SnapTradeServiceError):
-    """Raised when an order is attempted while the safety switches forbid it."""
 
 
 def to_plain(value: Any) -> Any:
@@ -271,6 +265,62 @@ class SnapTradeService:
             days=30,
         )
         return body if isinstance(body, list) else body.get("orders", []) if isinstance(body, dict) else []
+
+    def get_quotes(self, user_id: str, user_secret: str, account_id: str, symbols: list[str]) -> dict:
+        """Live quotes from the brokerage: {SYMBOL: {"bid", "ask", "last"}}."""
+        if not symbols:
+            return {}
+        body = self._call(
+            "get quotes",
+            self.client.trading.get_user_account_quotes,
+            user_id=user_id,
+            user_secret=user_secret,
+            account_id=account_id,
+            symbols=",".join(s.upper() for s in symbols),
+            use_ticker=True,
+        )
+        quotes = {}
+        for q in body if isinstance(body, list) else []:
+            sym = q.get("symbol")
+            if isinstance(sym, dict):
+                sym = sym.get("symbol") or sym.get("raw_symbol")
+            if not sym:
+                continue
+            quotes[str(sym).upper()] = {
+                "bid": _to_float(q.get("bid_price")),
+                "ask": _to_float(q.get("ask_price")),
+                "last": _to_float(q.get("last_trade_price")),
+            }
+        return quotes
+
+    def get_order_status(self, user_id: str, user_secret: str, account_id: str, order_id: str) -> dict:
+        """Return {"status", "filled_qty", "price", "raw"}; status is upper-case
+        (e.g. EXECUTED, PARTIAL, PENDING, ACCEPTED, CANCELED, REJECTED, EXPIRED)."""
+        body = self._call(
+            "get order",
+            self.client.account_information.get_user_account_order_detail,
+            user_id=user_id,
+            user_secret=user_secret,
+            account_id=account_id,
+            brokerage_order_id=order_id,
+        )
+        body = body if isinstance(body, dict) else {}
+        return {
+            "status": str(body.get("status") or "").upper(),
+            "filled_qty": _to_float(body.get("filled_quantity")) or 0.0,
+            "price": _to_float(body.get("execution_price")),
+            "raw": body,
+        }
+
+    def cancel_order(self, user_id: str, user_secret: str, account_id: str, order_id: str) -> dict:
+        return self._call(
+            "cancel order",
+            self.client.trading.cancel_order,
+            user_id=user_id,
+            user_secret=user_secret,
+            account_id=account_id,
+            brokerage_order_id=order_id,
+        )
 
     # -- trading -------------------------------------------------------------
     def execute_order(

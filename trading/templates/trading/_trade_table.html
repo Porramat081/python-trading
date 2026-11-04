@@ -1,19 +1,22 @@
 <div class="scroll">
 <table>
-  <thead><tr><th>Time (ET)</th><th>Symbol</th><th>Side</th><th class="num">Qty</th><th class="num">Price</th><th>Status</th><th>Note</th></tr></thead>
+  <thead><tr><th>Time (ET)</th><th>Symbol</th><th>Side</th><th>Reason</th><th>Type</th><th class="num">Qty</th><th class="num">Limit</th><th class="num">Fill</th><th>Status</th><th>Note</th></tr></thead>
   <tbody>
   {% for t in trades %}
     <tr>
       <td class="muted" title="{{ t.created_at|date:'Y-m-d H:i:s T' }}">{{ t.created_at|date:"M j, H:i T" }}</td>
       <td><strong>{{ t.symbol }}</strong></td>
       <td class="{% if t.action == 'BUY' %}up{% else %}down{% endif %}">{{ t.action }}</td>
+      <td class="muted">{{ t.get_reason_display }}</td>
+      <td class="muted">{{ t.order_type }}</td>
       <td class="num">{{ t.quantity|floatformat:"-4" }}</td>
+      <td class="num">{{ t.limit_price|floatformat:2|default:"—" }}</td>
       <td class="num">{{ t.price|floatformat:2|default:"—" }}</td>
       <td class="status-{{ t.status|lower }}">{{ t.get_status_display }}</td>
       <td class="note">{{ t.message|truncatechars:90 }}</td>
     </tr>
   {% empty %}
-    <tr><td colspan="7" class="muted">No trades yet.</td></tr>
+    <tr><td colspan="10" class="muted">No orders yet.</td></tr>
   {% endfor %}
   </tbody>
 </table>

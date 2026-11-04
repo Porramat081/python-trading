@@ -6,9 +6,8 @@ from django.shortcuts import redirect, render
 from django.urls import path, reverse
 
 from services.massive_service import MassiveAPIError, fetch_historical_data
-from services.momentum_strategy import run_strategy, start_strategy
 
-from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
+from .models import BrokerageAccount, DayTradeSettings, ObserveItem, Position, ScanResult, StockData, TradeLog
 
 
 class BackfillForm(forms.Form):
@@ -21,19 +20,6 @@ class BackfillForm(forms.Form):
     multiplier = forms.IntegerField(min_value=1, initial=1)
 
 
-def _backfill(modeladmin, request, symbols, days=365):
-    end = date.today()
-    start = end - timedelta(days=days)
-    for symbol in sorted(set(symbols)):
-        try:
-            s = fetch_historical_data(symbol, start, end)
-            modeladmin.message_user(
-                request, f"{s['symbol']}: {s['created']} new candles ({s['skipped']} already stored)."
-            )
-        except MassiveAPIError as exc:
-            modeladmin.message_user(request, f"{symbol}: backfill failed - {exc}", messages.ERROR)
-
-
 @admin.register(BrokerageAccount)
 class BrokerageAccountAdmin(admin.ModelAdmin):
     list_display = ("user", "brokerage_name", "account_name", "account_id", "is_paper", "created_at")
@@ -43,7 +29,6 @@ class BrokerageAccountAdmin(admin.ModelAdmin):
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
-        # Don't echo the SnapTrade secret back in the page.
         form.base_fields["snaptrade_user_secret"].widget = forms.PasswordInput(render_value=True)
         return form
 
@@ -55,17 +40,10 @@ class StockDataAdmin(admin.ModelAdmin):
     search_fields = ("symbol",)
     date_hierarchy = "timestamp"
     ordering = ("symbol", "-timestamp")
-    actions = ["backfill_symbols"]
     change_list_template = "admin/trading/stockdata/change_list.html"
 
     def get_urls(self):
-        custom = [
-            path(
-                "backfill/",
-                self.admin_site.admin_view(self.backfill_view),
-                name="trading_stockdata_backfill",
-            )
-        ]
+        custom = [path("backfill/", self.admin_site.admin_view(self.backfill_view), name="trading_stockdata_backfill")]
         return custom + super().get_urls()
 
     def backfill_view(self, request):
@@ -74,87 +52,62 @@ class StockDataAdmin(admin.ModelAdmin):
             d = form.cleaned_data
             try:
                 s = fetch_historical_data(
-                    d["symbol"], d["start_date"], d["end_date"],
-                    timespan=d["timespan"], multiplier=d["multiplier"],
+                    d["symbol"], d["start_date"], d["end_date"], timespan=d["timespan"], multiplier=d["multiplier"]
                 )
-                self.message_user(
-                    request,
-                    f"{s['symbol']}: fetched {s['fetched']}, created {s['created']}, skipped {s['skipped']}.",
-                )
+                self.message_user(request, f"{s['symbol']}: fetched {s['fetched']}, created {s['created']}.")
                 return redirect(reverse("admin:trading_stockdata_changelist") + f"?symbol={s['symbol']}")
             except MassiveAPIError as exc:
                 self.message_user(request, f"Backfill failed: {exc}", messages.ERROR)
-        context = {
-            **self.admin_site.each_context(request),
-            "opts": self.model._meta,
-            "form": form,
-            "title": "Backfill historical data",
-        }
+        context = {**self.admin_site.each_context(request), "opts": self.model._meta, "form": form,
+                   "title": "Backfill historical data"}
         return render(request, "admin/trading/stockdata/backfill.html", context)
 
-    @admin.action(description="Backfill last 365 days for selected symbols")
-    def backfill_symbols(self, request, queryset):
-        _backfill(self, request, queryset.values_list("symbol", flat=True).distinct())
+
+@admin.register(DayTradeSettings)
+class DayTradeSettingsAdmin(admin.ModelAdmin):
+    list_display = ("__str__", "auto_trading", "account", "timeframe_minutes", "block_usd", "stop_loss_pct", "liquidate_at")
+    readonly_fields = ("last_scan_at", "last_cycle_at", "last_liquidation_date")
+
+    def has_add_permission(self, request):
+        return not DayTradeSettings.objects.exists()
 
 
-@admin.register(StrategyConfig)
-class StrategyConfigAdmin(admin.ModelAdmin):
-    list_display = (
-        "name", "symbol", "is_active", "ma_type", "short_window", "long_window",
-        "account", "trade_quantity", "last_signal", "trend", "last_run",
-    )
-    list_filter = ("is_active", "ma_type", "symbol")
-    list_editable = ("is_active",)
-    search_fields = ("name", "symbol")
-    readonly_fields = ("last_run", "last_signal", "trend", "last_signal_bar")
-    actions = ["run_selected", "evaluate_selected", "backfill_selected", "activate", "deactivate"]
+class OrderInline(admin.TabularInline):
+    model = TradeLog
+    extra = 0
+    fields = ("created_at", "action", "reason", "order_type", "quantity", "limit_price", "price", "status", "order_id")
+    readonly_fields = fields
+    can_delete = False
 
-    def save_model(self, request, obj, form, change):
-        super().save_model(request, obj, form, change)
-        if not change:
-            # Same automatic setup as the web UI: backfill, evaluate, switch ON, trend entry.
-            try:
-                result = start_strategy(obj)
-                self.message_user(request, f"Auto-start: {result}")
-            except Exception as exc:
-                self.message_user(request, f"Auto-start failed: {exc}", messages.ERROR)
 
-    @admin.action(description="Run strategy evaluation (place orders on signals)")
-    def run_selected(self, request, queryset):
-        self._run(request, queryset, execute=True)
+@admin.register(Position)
+class PositionAdmin(admin.ModelAdmin):
+    list_display = ("symbol", "status", "simulated", "blocks", "quantity", "avg_price", "stop_price",
+                    "last_price", "exit_price", "exit_reason", "opened_at", "closed_at")
+    list_filter = ("status", "simulated", "exit_reason")
+    search_fields = ("symbol",)
+    inlines = [OrderInline]
 
-    @admin.action(description="Evaluate only (no orders)")
-    def evaluate_selected(self, request, queryset):
-        self._run(request, queryset, execute=False)
 
-    def _run(self, request, queryset, execute):
-        for strategy in queryset.select_related("account"):
-            try:
-                result = run_strategy(strategy, execute=execute)
-                level = messages.SUCCESS if result.signal != "HOLD" else messages.INFO
-                if result.trade_status == "FAILED":
-                    level = messages.ERROR
-                self.message_user(request, str(result), level)
-            except Exception as exc:
-                self.message_user(request, f"{strategy.name}: {exc}", messages.ERROR)
+@admin.register(ObserveItem)
+class ObserveItemAdmin(admin.ModelAdmin):
+    list_display = ("symbol", "reason", "added_at", "note")
+    list_filter = ("reason",)
 
-    @admin.action(description="Backfill last 365 days of data for selected strategies")
-    def backfill_selected(self, request, queryset):
-        _backfill(self, request, queryset.values_list("symbol", flat=True))
 
-    @admin.action(description="Activate selected strategies")
-    def activate(self, request, queryset):
-        self.message_user(request, f"Activated {queryset.update(is_active=True)} strategies.")
-
-    @admin.action(description="Deactivate selected strategies")
-    def deactivate(self, request, queryset):
-        self.message_user(request, f"Deactivated {queryset.update(is_active=False)} strategies.")
+@admin.register(ScanResult)
+class ScanResultAdmin(admin.ModelAdmin):
+    list_display = ("scanned_at", "symbol", "outcome", "price", "change_pct", "volume", "daily_sma50", "note")
+    list_filter = ("outcome",)
+    search_fields = ("symbol",)
+    date_hierarchy = "scanned_at"
 
 
 @admin.register(TradeLog)
 class TradeLogAdmin(admin.ModelAdmin):
-    list_display = ("created_at", "symbol", "action", "quantity", "price", "status", "order_id", "account", "strategy")
-    list_filter = ("status", "action", "symbol")
+    list_display = ("created_at", "symbol", "action", "reason", "order_type", "quantity", "limit_price",
+                    "price", "status", "order_id")
+    list_filter = ("status", "action", "reason")
     search_fields = ("symbol", "order_id", "message")
     readonly_fields = [f.name for f in TradeLog._meta.fields]
 

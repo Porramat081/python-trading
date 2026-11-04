@@ -1,64 +1,477 @@
-from datetime import datetime, timedelta, timezone as dt_tz
+from datetime import datetime, time as dtime, timedelta, timezone as dt_tz
 from decimal import Decimal
 from io import StringIO
 from unittest import mock
+from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 from django.contrib.auth import get_user_model
 from django.core.management import call_command
 from django.test import TestCase, override_settings
 from django.urls import reverse
+from django.utils import timezone
 
-from services import momentum_strategy as ms
-from services.massive_service import Candle, MassiveAPIError, MassiveClient, fetch_historical_data
+from services import indicators as ind
+from services.daytrader import Bars, DayTrader, SimBroker
+from services.massive_service import Candle, MassiveAPIError, MassiveClient, _snapshot_row, fetch_historical_data
 from services.snaptrade_service import SnapTradeService, SnapTradeServiceError, TradingDisabledError
 
-from .models import BrokerageAccount, StockData, StrategyConfig, TradeLog
+from .models import BrokerageAccount, DayTradeSettings, ObserveItem, Position, ScanResult, StockData, TradeLog
 
+NY = ZoneInfo("America/New_York")
 START = datetime(2025, 1, 1, tzinfo=dt_tz.utc)
+MONDAY_1030 = datetime(2026, 11, 2, 10, 30, tzinfo=NY)
 
 
-def make_candles(symbol, closes):
-    StockData.objects.bulk_create(
-        StockData(
-            symbol=symbol,
-            timestamp=START + timedelta(days=i),
-            open_price=c, high_price=c, low_price=c, close_price=c, volume=1000,
-        )
-        for i, c in enumerate(closes)
+def path(seed):
+    """Deterministic intraday path: a gentle decline followed by a noisy rise."""
+    r = np.random.default_rng(seed)
+    down = np.linspace(100, 96, 45) + r.normal(0, 0.08, 45)
+    up = 96 + np.cumsum(r.normal(0.04, 0.12, 80))
+    return np.r_[down, up]
+
+
+def closes(seed, n):
+    return pd.Series(path(seed)[:n])
+
+
+# Prefixes of the paths above that trigger each rule on the last bar (found by search).
+BUY = (2, 58)          # fresh 9/21 cross + RSI 45-65 + expanding MACD
+DEVELOPING = (0, 56)   # uptrend, momentum not confirmed yet
+CONFIRM = (0, 67)      # same path later: confirmation buy
+WARNING = (0, 62)      # momentum warning
+EXIT = (1, 64)         # 9 EMA crosses below 21 EMA
+ADD_ON = (1, 68)       # RSI bounce off 50 + expanding MACD
+
+
+class FakeData:
+    """Market data the tests control."""
+
+    def __init__(self):
+        self.series = {}
+        self.last = {}
+        self.daily = {}
+        self.rows = []
+        self.calls = 0
+
+    def set(self, symbol, spec, last=None, daily_ok=True):
+        s = closes(*spec)
+        self.series[symbol] = s
+        self.last[symbol] = float(s.iloc[-1]) if last is None else last
+        self.daily[symbol] = pd.Series([50.0] * 60) if daily_ok else pd.Series([500.0] * 60)
+
+    def intraday(self, symbol, minutes, now):
+        self.calls += 1
+        return Bars(self.series.get(symbol, pd.Series(dtype=float)), self.last.get(symbol))
+
+    def daily_closes(self, symbol, now):
+        return self.daily.get(symbol, pd.Series(dtype=float))
+
+    def screener(self, source):
+        return self.rows
+
+
+class FakeLiveBroker:
+    """A non-simulated broker whose orders stay pending until the test says otherwise."""
+
+    simulated = False
+
+    def __init__(self, held=()):
+        self.orders, self.cancelled, self.held = [], [], set(held)
+        self.state = {}
+
+    def quote_ask(self, symbol):
+        return 100.00
+
+    def held_symbols(self):
+        return self.held
+
+    def place(self, symbol, side, quantity, order_type, limit_price=None, ref_price=None):
+        oid = f"ord-{len(self.orders) + 1}"
+        self.orders.append({"id": oid, "symbol": symbol, "side": side, "qty": quantity, "type": order_type, "limit": limit_price})
+        self.state[oid] = {"status": "PENDING", "filled_qty": 0, "price": None}
+        return {"order_id": oid, "status": "PENDING", "filled": False}
+
+    def status(self, order_id):
+        return self.state[order_id]
+
+    def cancel(self, order_id):
+        self.cancelled.append(order_id)
+        self.state[order_id] = {"status": "CANCELED", "filled_qty": 0, "price": None}
+
+
+def trader(data, now=MONDAY_1030, broker=None, **cfg):
+    config = DayTradeSettings.load()
+    for k, v in cfg.items():
+        setattr(config, k, v)
+    config.save()
+    return DayTrader(config=config, data=data, broker=broker or SimBroker(), now=now)
+
+
+def open_position(symbol="AAA", qty=10, avg="97.00", blocks=1, stop_pct=Decimal("1.5")):
+    avg = Decimal(avg)
+    return Position.objects.create(
+        symbol=symbol, status="OPEN", simulated=True, blocks=blocks, quantity=qty, avg_price=avg,
+        stop_price=(avg * (1 - stop_pct / 100)).quantize(Decimal("0.0001")), last_price=avg,
     )
 
 
-# Falling prices, then a sharp rally on the final bar -> short MA crosses above long MA.
-CROSS_UP = [100 - i for i in range(30)] + [200]
-CROSS_DOWN = [50 + i for i in range(30)] + [1]
-
-
-class FakeService:
-    def __init__(self, held=0.0, fail=False):
-        self.held = held
-        self.fail = fail
-        self.orders = []
-
-    def get_position_units(self, *args):
-        return self.held
-
-    def execute_order(self, **kwargs):
-        if self.fail:
-            raise SnapTradeServiceError("Insufficient buying power", status=400)
-        self.orders.append(kwargs)
-        return {"order_id": "ord-1", "status": "EXECUTED", "price": 201.5, "raw": {}}
-
-
+# ---------------------------------------------------------------------------------
 class IndicatorTests(TestCase):
-    def test_sma_crossover_signals(self):
-        self.assertEqual(ms.generate_signal(pd.Series(CROSS_UP, dtype=float), 3, 10), ms.BUY)
-        self.assertEqual(ms.generate_signal(pd.Series(CROSS_DOWN, dtype=float), 3, 10), ms.SELL)
-        self.assertEqual(ms.generate_signal(pd.Series([10.0] * 30), 3, 10), ms.HOLD)
+    def test_rule_prefixes(self):
+        self.assertTrue(ind.snapshot(closes(*BUY)).buy_signal)
+        s = ind.snapshot(closes(*DEVELOPING))
+        self.assertTrue(s.developing and not s.confirmation_buy)
+        self.assertEqual(s.classify_new(), "OBSERVE")
+        self.assertTrue(ind.snapshot(closes(*CONFIRM)).confirmation_buy)
+        self.assertTrue(ind.snapshot(closes(*WARNING)).momentum_warning)
+        s = ind.snapshot(closes(*EXIT))
+        self.assertTrue(s.exit_signal and s.cross_down)
+        self.assertTrue(ind.snapshot(closes(*ADD_ON)).add_on_signal)
 
-    def test_ema_and_insufficient_data(self):
-        self.assertEqual(ms.generate_signal(pd.Series(CROSS_UP, dtype=float), 3, 10, "EMA"), ms.BUY)
-        self.assertEqual(ms.generate_signal(pd.Series([1.0, 2.0]), 3, 10), ms.HOLD)
+    def test_rsi_and_daily_filter(self):
+        self.assertEqual(ind.rsi(pd.Series([100.0] * 30)).iloc[-1], 50.0)
+        self.assertEqual(ind.rsi(pd.Series(np.arange(30, dtype=float))).iloc[-1], 100.0)
+        self.assertEqual(ind.above_daily_sma(pd.Series(range(1, 61), dtype=float), 70), (True, 35.5))
+        self.assertEqual(ind.above_daily_sma(pd.Series([1.0] * 10), 70), (False, None))
+        self.assertIsNone(ind.snapshot(pd.Series([1.0] * 10)))
+
+
+class ScreenerScanTests(TestCase):
+    """Case 1: morning screener."""
+
+    def test_candidate_filters_and_ranking(self):
+        data = FakeData()
+        data.rows = [
+            {"symbol": "AAA", "price": 50, "volume": 2_000_000, "change_pct": 5},
+            {"symbol": "BBB", "price": 3, "volume": 9_000_000, "change_pct": 30},       # too cheap
+            {"symbol": "CCC", "price": 60, "volume": 10_000, "change_pct": 20},         # too little volume
+            {"symbol": "DDD.WS", "price": 60, "volume": 5_000_000, "change_pct": 25},   # warrant
+            {"symbol": "EEE", "price": 80, "volume": 3_000_000, "change_pct": 9},
+        ]
+        t = trader(data, screener_count=5)
+        self.assertEqual([r["symbol"] for r in t.candidates()], ["EEE", "AAA"])
+        t.cfg.screener_source = "MOST_ACTIVE"
+        self.assertEqual([r["symbol"] for r in t.candidates()], ["EEE", "AAA"])
+        t.cfg.screener_count = 1
+        self.assertEqual(len(t.candidates()), 1)
+
+    def test_scan_outcomes(self):
+        data = FakeData()
+        data.set("BUYME", BUY)
+        data.set("WATCH", DEVELOPING)
+        data.set("LOWER", BUY, daily_ok=False)
+        data.set("BEAR", EXIT)
+        data.rows = [{"symbol": s, "price": 97, "volume": 5_000_000, "change_pct": 5 - i}
+                     for i, s in enumerate(["BUYME", "WATCH", "LOWER", "BEAR", "HELD"])]
+        open_position("HELD")
+        t = trader(data)
+        t.scan()
+        outcomes = dict(ScanResult.objects.values_list("symbol", "outcome"))
+        self.assertEqual(outcomes, {"BUYME": "BUY", "WATCH": "OBSERVE", "LOWER": "BELOW_SMA", "BEAR": "DISCARD", "HELD": "HELD"})
+
+        pos = Position.objects.get(symbol="BUYME")
+        last = data.last["BUYME"]
+        limit = Decimal(str(round(last + 0.02, 2)))
+        self.assertEqual((pos.status, pos.blocks, pos.simulated), ("OPEN", 1, True))
+        self.assertEqual(pos.quantity, Decimal(int(1000 // float(limit))))
+        self.assertEqual(pos.avg_price, limit)
+        self.assertEqual(pos.stop_price, (limit * Decimal("0.985")).quantize(Decimal("0.0001")))
+        log = pos.orders.get()
+        self.assertEqual((log.status, log.order_type, log.reason), ("SIMULATED", "Limit", "ENTRY"))
+        self.assertTrue(ObserveItem.objects.filter(symbol="WATCH", reason="DEVELOPING").exists())
+        self.assertFalse(ObserveItem.objects.filter(symbol="BEAR").exists())
+
+    def test_scan_runs_once_per_day_in_cycle(self):
+        data = FakeData()
+        t = trader(data)
+        with mock.patch.object(DayTrader, "scan") as scan:
+            t.run_cycle()
+            self.assertEqual(scan.call_count, 1)
+        t.cfg.last_scan_at = timezone.now()
+        t.cfg.save()
+        with mock.patch.object(DayTrader, "scan") as scan:
+            trader(data, now=timezone.now()).run_cycle(force=True)
+            scan.assert_not_called()
+
+    def test_max_open_positions(self):
+        data = FakeData()
+        data.set("NEW", BUY)
+        data.rows = [{"symbol": "NEW", "price": 97, "volume": 5_000_000, "change_pct": 5}]
+        open_position("X1")
+        trader(data, max_open_positions=1).scan()
+        self.assertEqual(ScanResult.objects.get().outcome, "SKIPPED")
+        self.assertFalse(Position.objects.filter(symbol="NEW").exists())
+
+
+class HoldingsTests(TestCase):
+    """Case 2: monitoring current holdings."""
+
+    def test_stop_loss(self):
+        data = FakeData()
+        data.set("AAA", DEVELOPING, last=95.0)  # 97 * 0.985 = 95.545 -> stop hit
+        pos = open_position("AAA")
+        trader(data).monitor_holdings()
+        pos.refresh_from_db()
+        self.assertEqual((pos.status, pos.exit_reason), ("CLOSED", "Stop-loss"))
+        self.assertEqual(pos.exit_price, Decimal("95"))
+        self.assertEqual(pos.orders.get().order_type, "Market")
+
+    def test_exit_signal(self):
+        data = FakeData()
+        data.set("AAA", EXIT)
+        pos = open_position("AAA", avg="90")
+        trader(data).monitor_holdings()
+        pos.refresh_from_db()
+        self.assertEqual((pos.status, pos.exit_reason), ("CLOSED", "Exit signal"))
+
+    def test_add_on_respects_block_cap(self):
+        data = FakeData()
+        data.set("AAA", ADD_ON)
+        pos = open_position("AAA", avg="90")
+        trader(data).monitor_holdings()
+        pos.refresh_from_db()
+        self.assertEqual(pos.blocks, 2)
+        self.assertGreater(pos.quantity, 10)
+        trader(data).monitor_holdings()  # cap reached: no third block
+        pos.refresh_from_db()
+        self.assertEqual(pos.blocks, 2)
+        self.assertEqual(pos.orders.filter(reason="ADD_ON").count(), 1)
+
+    def test_momentum_warning_flags_observe(self):
+        data = FakeData()
+        data.set("AAA", WARNING)
+        open_position("AAA", avg="90")
+        trader(data).monitor_holdings()
+        self.assertEqual(ObserveItem.objects.get(symbol="AAA").reason, "WARNING")
+
+
+class ObserveListTests(TestCase):
+    """Case 3: observe list."""
+
+    def test_expiry_of_unowned(self):
+        ObserveItem.objects.create(symbol="OLD", added_at=timezone.now() - timedelta(minutes=61))
+        ObserveItem.objects.create(symbol="NEW", added_at=timezone.now() - timedelta(minutes=5))
+        data = FakeData()
+        data.set("NEW", DEVELOPING)
+        trader(data).process_observe_list()
+        self.assertEqual(list(ObserveItem.objects.values_list("symbol", flat=True)), ["NEW"])
+
+    def test_confirmation_buy_moves_to_holdings(self):
+        ObserveItem.objects.create(symbol="AAA")
+        data = FakeData()
+        data.set("AAA", CONFIRM)
+        trader(data).process_observe_list()
+        self.assertEqual(Position.objects.get(symbol="AAA").status, "OPEN")
+        self.assertFalse(ObserveItem.objects.filter(symbol="AAA").exists())
+
+    def test_owned_warning_kept_then_removed_after_close(self):
+        pos = open_position("AAA")
+        ObserveItem.objects.create(symbol="AAA", reason="WARNING", added_at=timezone.now() - timedelta(hours=3))
+        trader(FakeData()).process_observe_list()
+        self.assertTrue(ObserveItem.objects.filter(symbol="AAA").exists())  # owned: no expiry
+        pos.status = "CLOSED"
+        pos.save()
+        ObserveItem.objects.create(symbol="BBB", reason="WARNING")
+        trader(FakeData()).process_observe_list()
+        self.assertFalse(ObserveItem.objects.filter(symbol="BBB").exists())
+
+
+class EndOfDayTests(TestCase):
+    def test_liquidation_at_345(self):
+        data = FakeData()
+        data.set("AAA", BUY)
+        open_position("AAA")
+        open_position("BBB")
+        ObserveItem.objects.create(symbol="CCC")
+        t = trader(data, now=datetime(2026, 11, 2, 15, 45, tzinfo=NY))
+        with mock.patch.object(DayTrader, "scan") as scan:
+            t.run_cycle()
+            scan.assert_not_called()
+        self.assertFalse(Position.objects.filter(status="OPEN").exists())
+        self.assertEqual(set(Position.objects.values_list("exit_reason", flat=True)), {"End-of-day liquidation"})
+        self.assertFalse(ObserveItem.objects.exists())
+        self.assertEqual(t.cfg.last_liquidation_date, datetime(2026, 11, 2).date())
+
+    def test_no_entries_after_liquidation_time(self):
+        t = trader(FakeData(), now=datetime(2026, 11, 2, 15, 50, tzinfo=NY))
+        self.assertFalse(t._can_open_new())
+
+    def test_closed_market_does_nothing(self):
+        open_position("AAA")
+        report = trader(FakeData(), now=datetime(2026, 11, 7, 11, 0, tzinfo=NY)).run_cycle()  # Saturday
+        self.assertIn("Market closed", str(report))
+        self.assertEqual(Position.objects.get().status, "OPEN")
+
+    def test_scheduler_wakes_at_liquidation_time(self):
+        from trading.management.commands.run_scheduler import _sleep_seconds, market_is_open
+
+        now = datetime(2026, 11, 2, 15, 44, 0, tzinfo=NY)
+        self.assertEqual(_sleep_seconds(now, 2, dtime(15, 45)), 61)
+        self.assertEqual(_sleep_seconds(datetime(2026, 11, 2, 11, 0, tzinfo=NY), 2, dtime(15, 45)), 120)
+        self.assertTrue(market_is_open(datetime(2026, 11, 2, 14, 45, tzinfo=dt_tz.utc)))   # 09:45 EST
+        self.assertFalse(market_is_open(datetime(2026, 11, 2, 14, 15, tzinfo=dt_tz.utc)))  # 09:15 EST
+
+
+class LiveOrderFlowTests(TestCase):
+    """Limit buys at ask + $0.02 that stay pending until the broker reports a fill."""
+
+    def setUp(self):
+        self.data = FakeData()
+        self.data.set("AAA", BUY)
+        self.broker = FakeLiveBroker()
+
+    def test_limit_buy_then_fill(self):
+        t = trader(self.data, broker=self.broker)
+        t.enter("AAA", 99.5, reason="ENTRY")
+        order = self.broker.orders[0]
+        self.assertEqual((order["type"], order["limit"], order["qty"]), ("Limit", Decimal("100.02"), 9))
+        pos = Position.objects.get()
+        self.assertEqual(pos.status, "PENDING")
+        self.broker.state["ord-1"] = {"status": "EXECUTED", "filled_qty": 9, "price": 100.01}
+        trader(self.data, broker=self.broker).reconcile_orders()
+        pos.refresh_from_db()
+        self.assertEqual((pos.status, pos.quantity, pos.avg_price), ("OPEN", Decimal("9"), Decimal("100.01")))
+        self.assertEqual(pos.orders.get().status, "EXECUTED")
+
+    def test_unfilled_buy_cancelled_after_timeout(self):
+        t = trader(self.data, broker=self.broker)
+        log = t.enter("AAA", 99.5, reason="ENTRY")
+        TradeLog.objects.filter(pk=log.pk).update(created_at=timezone.now() - timedelta(minutes=6))
+        trader(self.data, broker=self.broker).reconcile_orders()
+        self.assertEqual(self.broker.cancelled, ["ord-1"])
+        self.assertEqual(TradeLog.objects.get().status, "CANCELED")
+        self.assertEqual(Position.objects.get().status, "CANCELED")
+
+    def test_broker_holdings_are_skipped(self):
+        self.data.rows = [{"symbol": "AAA", "price": 97, "volume": 5_000_000, "change_pct": 5}]
+        trader(self.data, broker=FakeLiveBroker(held={"AAA"})).scan()
+        self.assertEqual(ScanResult.objects.get().outcome, "HELD")
+
+    def test_eod_cancels_pending_buys(self):
+        t = trader(self.data, broker=self.broker)
+        t.enter("AAA", 99.5, reason="ENTRY")
+        trader(self.data, broker=self.broker, now=datetime(2026, 11, 2, 15, 45, tzinfo=NY)).run_cycle()
+        self.assertEqual(self.broker.cancelled, ["ord-1"])
+        self.assertEqual(Position.objects.get().status, "CANCELED")
+
+    def test_disabled_trading_is_skipped_not_failed(self):
+        class Refusing(FakeLiveBroker):
+            def place(self, *a, **k):
+                raise TradingDisabledError("TRADING_ENABLED is False")
+
+        trader(self.data, broker=Refusing()).enter("AAA", 99.5, reason="ENTRY")
+        self.assertEqual(TradeLog.objects.get().status, "SKIPPED")
+        self.assertEqual(Position.objects.get().status, "CANCELED")
+
+
+@override_settings(SNAPTRADE_CLIENT_ID="", SNAPTRADE_CONSUMER_KEY="")
+class ViewTests(TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user("trader", password="pw-123456")
+        self.client.force_login(self.user)
+
+    def test_login_required(self):
+        self.client.logout()
+        self.assertEqual(self.client.get(reverse("trading:dashboard")).status_code, 302)
+
+    def test_pages_render(self):
+        open_position("AAA")
+        ObserveItem.objects.create(symbol="BBB")
+        ScanResult.objects.create(symbol="CCC", outcome="DISCARD", note="bearish")
+        for name in ("trading:dashboard", "trading:strategy", "trading:positions"):
+            self.assertEqual(self.client.get(reverse(name)).status_code, 200, name)
+        html = self.client.get(reverse("trading:dashboard")).content.decode()
+        for text in ("AAA", "BBB", "CCC", "Auto day trading OFF", 'id="mkt-clock"'):
+            self.assertIn(text, html)
+
+    def test_save_settings_and_toggle(self):
+        data = {
+            "account": "", "timeframe_minutes": 15, "loop_minutes": 3, "block_usd": "2500", "max_blocks": 2,
+            "max_open_positions": 4, "stop_loss_pct": "1.5", "limit_offset": "0.02", "buy_timeout_minutes": 5,
+            "liquidate_at": "15:45", "observe_minutes": 60, "screener_source": "MOST_ACTIVE", "screener_count": 8,
+            "min_price": "5", "max_price": "300", "min_volume": 2000000,
+        }
+        self.client.post(reverse("trading:strategy"), data)
+        cfg = DayTradeSettings.load()
+        self.assertEqual((cfg.timeframe_minutes, cfg.block_usd, cfg.screener_source), (15, Decimal("2500"), "MOST_ACTIVE"))
+        response = self.client.post(reverse("trading:strategy"), {**data, "loop_minutes": 10})
+        self.assertContains(response, "1–5 minutes")
+        self.client.post(reverse("trading:toggle_auto"))
+        self.assertTrue(DayTradeSettings.load().auto_trading)
+
+    def test_close_position_and_close_all(self):
+        pos = open_position("AAA")
+        open_position("BBB")
+        with mock.patch("services.daytrader.MassiveData") as md:
+            md.return_value.intraday.return_value = Bars(pd.Series(dtype=float), 98.0)
+            self.client.post(reverse("trading:position_close", args=[pos.pk]))
+            pos.refresh_from_db()
+            self.assertEqual((pos.status, pos.exit_reason), ("CLOSED", "Manual"))
+            self.client.post(reverse("trading:liquidate_now"))
+        self.assertFalse(Position.objects.filter(status="OPEN").exists())
+
+    def test_chart_endpoint(self):
+        s = closes(*BUY)
+        idx = pd.date_range("2026-11-02 14:30", periods=len(s), freq="5min", tz="UTC")
+        with mock.patch("trading.views.MassiveData") as md:
+            md.return_value.intraday.return_value = Bars(pd.Series(s.values, index=idx), 97.0)
+            data = self.client.get(reverse("trading:chart", args=["aaa"])).json()
+        self.assertEqual(data["symbol"], "AAA")
+        self.assertEqual(len(data["labels"]), len(s))
+        self.assertEqual(data["labels"][0], "11-02 09:30")  # shown in New York time
+        self.assertIsNotNone(data["ema_slow"][-1])
+
+    def test_trade_times_in_eastern(self):
+        log = TradeLog.objects.create(symbol="AAPL", action="BUY", quantity=1, status="SIMULATED")
+        TradeLog.objects.filter(pk=log.pk).update(created_at=datetime(2026, 1, 15, 15, 0, tzinfo=dt_tz.utc))
+        self.assertContains(self.client.get(reverse("trading:dashboard")), "Jan 15, 10:00 EST")
+
+
+class CommandTests(TestCase):
+    def test_run_daytrade_scan(self):
+        out = StringIO()
+        with mock.patch("services.daytrader.MassiveData") as md:
+            md.return_value.screener.return_value = []
+            call_command("run_daytrade", "--scan", stdout=out)
+        self.assertIn("Scanned 0 candidates", out.getvalue())
+
+    def test_run_daytrade_liquidate(self):
+        open_position("AAA")
+        with mock.patch("services.daytrader.MassiveData") as md:
+            md.return_value.intraday.return_value = Bars(pd.Series(dtype=float), 98.0)
+            call_command("run_daytrade", "--liquidate", stdout=StringIO())
+        self.assertEqual(Position.objects.get().exit_reason, "Manual")
+
+
+class MassiveIntradayTests(TestCase):
+    def test_regular_session_filter_and_snapshot_rows(self):
+        def bar(hh, mm):
+            ts = datetime(2026, 11, 2, hh, mm, tzinfo=NY).astimezone(dt_tz.utc)
+            return Candle("AAA", ts, Decimal(1), Decimal(1), Decimal(1), Decimal(1), 1)
+
+        client = MassiveClient(api_key="k", base_url="https://x", session=mock.Mock())
+        with mock.patch.object(MassiveClient, "get_aggregates", return_value=[bar(8, 0), bar(9, 30), bar(15, 55), bar(16, 0)]):
+            got = client.get_intraday_bars("AAA", 5)
+        self.assertEqual([b.timestamp.astimezone(NY).strftime("%H:%M") for b in got], ["09:30", "15:55"])
+        row = _snapshot_row({"ticker": "aaa", "todaysChangePerc": 3.5, "day": {"c": 0, "v": 0},
+                             "min": {"c": 12.3, "av": 50000}, "lastTrade": {"p": 12.4}})
+        self.assertEqual(row, {"symbol": "AAA", "price": 12.4, "volume": 50000, "change_pct": 3.5})
+
+    def test_snaptrade_quotes_and_order_status(self):
+        client = mock.Mock()
+        client.trading.get_user_account_quotes.return_value = mock.Mock(
+            body=[{"symbol": {"symbol": "AAPL"}, "bid_price": 189.9, "ask_price": 190.1, "last_trade_price": 190}]
+        )
+        client.account_information.get_user_account_order_detail.return_value = mock.Mock(
+            body={"status": "executed", "filled_quantity": "5", "execution_price": "190.05"}
+        )
+        svc = SnapTradeService(client=client)
+        self.assertEqual(svc.get_quotes("u", "s", "a", ["aapl"])["AAPL"]["ask"], 190.1)
+        self.assertEqual(svc.get_order_status("u", "s", "a", "o1"),
+                         {"status": "EXECUTED", "filled_qty": 5.0, "price": 190.05,
+                          "raw": {"status": "executed", "filled_quantity": "5", "execution_price": "190.05"}})
 
 
 class BackfillTests(TestCase):
@@ -98,74 +511,6 @@ class BackfillTests(TestCase):
         session.get.return_value = mock.Mock(status_code=403, headers={}, text="forbidden")
         with self.assertRaises(MassiveAPIError):
             MassiveClient(api_key="k", base_url="https://x", session=session).get_aggregates("A", "2025-01-01", "2025-01-02")
-
-
-class StrategyRunTests(TestCase):
-    def setUp(self):
-        self.user = get_user_model().objects.create_user("trader", password="pw-123456")
-        self.account = BrokerageAccount.objects.create(
-            user=self.user, snaptrade_user_id="u1", snaptrade_user_secret="s1",
-            account_id="acc-1", account_name="Paper", is_paper=True,
-        )
-        self.strategy = StrategyConfig.objects.create(
-            name="AAPL momentum", symbol="AAPL", is_active=True, short_window=3, long_window=10,
-            account=self.account, trade_quantity=Decimal("2"),
-        )
-
-    @override_settings(TRADING_ENABLED=False)
-    def test_dry_run_logs_skipped_trade(self):
-        make_candles("AAPL", CROSS_UP)
-        result = ms.MomentumStrategy(self.strategy, snaptrade_service=FakeService()).run()
-        self.assertEqual(result.signal, ms.BUY)
-        log = TradeLog.objects.get()
-        self.assertEqual(log.status, TradeLog.Status.SKIPPED)
-        self.strategy.refresh_from_db()
-        self.assertEqual(self.strategy.last_signal, ms.BUY)
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_buy_executes_once_per_candle(self):
-        make_candles("AAPL", CROSS_UP)
-        service = FakeService()
-        ms.MomentumStrategy(self.strategy, snaptrade_service=service).run()
-        ms.MomentumStrategy(self.strategy, snaptrade_service=service).run()
-        self.assertEqual(len(service.orders), 1)
-        self.assertEqual(service.orders[0]["side"], "BUY")
-        log = TradeLog.objects.get()
-        self.assertEqual((log.status, log.order_id), (TradeLog.Status.EXECUTED, "ord-1"))
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_sell_without_position_is_skipped_and_partial_sell_capped(self):
-        make_candles("AAPL", CROSS_DOWN)
-        ms.MomentumStrategy(self.strategy, snaptrade_service=FakeService(held=0)).run()
-        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.SKIPPED)
-
-        TradeLog.objects.all().delete()
-        self.strategy.last_signal_bar = None
-        service = FakeService(held=1.0)
-        ms.MomentumStrategy(self.strategy, snaptrade_service=service).run()
-        self.assertEqual(float(service.orders[0]["units"]), 1.0)
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_broker_error_marks_failed(self):
-        make_candles("AAPL", CROSS_UP)
-        ms.MomentumStrategy(self.strategy, snaptrade_service=FakeService(fail=True)).run()
-        log = TradeLog.objects.get()
-        self.assertEqual(log.status, TradeLog.Status.FAILED)
-        self.assertIn("Insufficient", log.message)
-
-    def test_not_enough_data(self):
-        make_candles("AAPL", [1, 2, 3])
-        result = ms.run_strategy(self.strategy)
-        self.assertEqual(result.signal, ms.HOLD)
-        self.assertIn("Not enough data", result.message)
-
-    @override_settings(TRADING_ENABLED=False)
-    def test_management_command(self):
-        make_candles("AAPL", CROSS_UP)
-        out = StringIO()
-        with mock.patch.object(ms.MomentumStrategy, "service", FakeService()):
-            call_command("run_strategy", "--symbol", "AAPL", stdout=out)
-        self.assertIn("BUY", out.getvalue())
 
 
 class SnapTradeServiceTests(TestCase):
@@ -232,163 +577,6 @@ class SnapTradeServiceTests(TestCase):
 
 
 @override_settings(SNAPTRADE_CLIENT_ID="", SNAPTRADE_CONSUMER_KEY="")
-class ViewTests(TestCase):
-    def setUp(self):
-        self.user = get_user_model().objects.create_user("trader", password="pw-123456")
-        self.strategy = StrategyConfig.objects.create(name="S", symbol="MSFT", short_window=3, long_window=10)
-        make_candles("MSFT", CROSS_UP)
-
-    def test_login_required(self):
-        response = self.client.get(reverse("trading:dashboard"))
-        self.assertEqual(response.status_code, 302)
-        self.assertIn(reverse("login"), response["Location"])
-
-    def test_pages_render(self):
-        self.client.force_login(self.user)
-        for name in ("trading:dashboard", "trading:positions", "trading:strategies"):
-            self.assertEqual(self.client.get(reverse(name)).status_code, 200, name)
-        self.assertEqual(self.client.get(reverse("trading:strategy_edit", args=[self.strategy.pk])).status_code, 200)
-
-    def test_chart_json(self):
-        self.client.force_login(self.user)
-        data = self.client.get(reverse("trading:strategy_chart", args=[self.strategy.pk])).json()
-        self.assertEqual(len(data["labels"]), len(CROSS_UP))
-        self.assertEqual(data["signals"][-1]["signal"], "BUY")
-
-    def test_toggle_and_create_strategy(self):
-        self.client.force_login(self.user)
-        self.client.post(reverse("trading:strategy_toggle", args=[self.strategy.pk]))
-        self.strategy.refresh_from_db()
-        self.assertTrue(self.strategy.is_active)
-
-        response = self.client.post(reverse("trading:strategies"), {
-            "name": "Bad", "symbol": "tsla", "ma_type": "SMA", "short_window": 50, "long_window": 10,
-            "trade_quantity": "1",
-        })
-        self.assertEqual(response.status_code, 200)  # validation error re-renders
-        self.client.post(reverse("trading:strategies"), {
-            "name": "Good", "symbol": "tsla", "ma_type": "EMA", "short_window": 5, "long_window": 20,
-            "trade_quantity": "1",
-        })
-        self.assertTrue(StrategyConfig.objects.get(name="Good").is_active)
-        self.assertTrue(StrategyConfig.objects.filter(name="Good", symbol="TSLA").exists())
-
-    def test_admin_pages(self):
-        admin = get_user_model().objects.create_superuser("admin", "a@example.com", "pw-123456")
-        self.client.force_login(admin)
-        for url in ("admin:trading_stockdata_changelist", "admin:trading_stockdata_backfill",
-                    "admin:trading_strategyconfig_changelist", "admin:trading_tradelog_changelist",
-                    "admin:trading_brokerageaccount_changelist"):
-            self.assertEqual(self.client.get(reverse(url)).status_code, 200, url)
-
-
-# Steady uptrend (short MA above long MA, no fresh crossover on the last bar) and the mirror.
-UPTREND = [100 + i for i in range(40)]
-DOWNTREND = [200 - i for i in range(40)]
-
-
-class AutoStartTests(TestCase):
-    """Creating a strategy: backfill -> evaluate -> switch ON -> trend-based entry."""
-
-    def setUp(self):
-        self.user = get_user_model().objects.create_user("trader", password="pw-123456")
-        self.account = BrokerageAccount.objects.create(
-            user=self.user, snaptrade_user_id="u1", snaptrade_user_secret="s1", account_id="acc-1", is_paper=True,
-        )
-        self.backfill = mock.patch(
-            "services.massive_service.fetch_historical_data",
-            return_value={"symbol": "AAPL", "fetched": 0, "created": 0, "skipped": 0},
-        )
-        self.backfill_mock = self.backfill.start()
-        self.addCleanup(self.backfill.stop)
-
-    def make(self, closes, **kw):
-        make_candles("AAPL", closes)
-        return StrategyConfig.objects.create(
-            name="A", symbol="AAPL", short_window=3, long_window=10, account=self.account, **kw
-        )
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_uptrend_buys_and_turns_on(self):
-        strategy = self.make(UPTREND)
-        service = FakeService()
-        result = ms.start_strategy(strategy, snaptrade_service=service)
-        self.backfill_mock.assert_called_once()
-        strategy.refresh_from_db()
-        self.assertTrue(strategy.is_active)
-        self.assertEqual((strategy.trend, result.signal), ("UP", "HOLD"))
-        self.assertEqual(service.orders[0]["side"], "BUY")
-        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.EXECUTED)
-        # The scheduler's next run on the same candle must not buy again.
-        ms.MomentumStrategy(strategy, snaptrade_service=service).run()
-        self.assertEqual(len(service.orders), 1)
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_downtrend_and_sell_do_not_buy(self):
-        for closes in (DOWNTREND, CROSS_DOWN):
-            StockData.objects.all().delete()
-            strategy = self.make(closes)
-            service = FakeService()
-            ms.start_strategy(strategy, snaptrade_service=service)
-            strategy.refresh_from_db()
-            self.assertTrue(strategy.is_active)
-            self.assertEqual(service.orders, [])
-        self.assertFalse(TradeLog.objects.exists())
-
-    @override_settings(TRADING_ENABLED=True)
-    def test_entry_skipped_when_already_holding(self):
-        strategy = self.make(UPTREND)
-        service = FakeService(held=5)
-        ms.start_strategy(strategy, snaptrade_service=service)
-        self.assertEqual(service.orders, [])
-        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.SKIPPED)
-
-    @override_settings(TRADING_ENABLED=False)
-    def test_dry_run_entry_logged_as_skipped(self):
-        strategy = self.make(CROSS_UP)
-        ms.start_strategy(strategy, snaptrade_service=FakeService())
-        self.assertEqual(TradeLog.objects.get().status, TradeLog.Status.SKIPPED)
-
-    def test_no_data_still_turns_on(self):
-        strategy = self.make([])
-        result = ms.start_strategy(strategy, snaptrade_service=FakeService())
-        strategy.refresh_from_db()
-        self.assertTrue(strategy.is_active)
-        self.assertIn("Not enough data", result.message)
-
-    @override_settings(TRADING_ENABLED=False)
-    def test_create_via_web_form_auto_starts(self):
-        make_candles("AAPL", UPTREND)
-        self.client.force_login(self.user)
-        response = self.client.post(reverse("trading:strategies"), {
-            "symbol": "aapl", "trade_quantity": "2", "account": self.account.pk,
-            "ma_type": "SMA", "short_window": 3, "long_window": 10, "name": "",
-        }, follow=True)
-        strategy = StrategyConfig.objects.get()
-        self.assertEqual(strategy.name, "AAPL SMA 3/10")
-        self.assertTrue(strategy.is_active)
-        self.assertEqual(strategy.trend, "UP")
-        self.assertContains(response, "Dry run")
-        self.assertEqual(TradeLog.objects.get().action, "BUY")
-
-    @override_settings(TRADING_ENABLED=False)
-    def test_scheduler_once_runs_active_strategies(self):
-        self.make(CROSS_UP, is_active=True)
-        StrategyConfig.objects.create(name="off", symbol="MSFT", short_window=3, long_window=10)
-        out = StringIO()
-        call_command("run_scheduler", "--once", stdout=out)
-        self.assertIn("AAPL: BUY", out.getvalue())
-        self.assertNotIn("MSFT", out.getvalue())
-
-    def test_market_hours(self):
-        from zoneinfo import ZoneInfo
-
-        from trading.management.commands.run_scheduler import market_is_open
-
-        ny = ZoneInfo("America/New_York")
-        self.assertTrue(market_is_open(datetime(2026, 11, 2, 10, 0, tzinfo=ny)))   # Monday
-        self.assertFalse(market_is_open(datetime(2026, 11, 2, 16, 30, tzinfo=ny)))
-        self.assertFalse(market_is_open(datetime(2026, 11, 7, 11, 0, tzinfo=ny)))  # Saturday
 
 
 class BackfillRefreshTests(TestCase):
@@ -406,42 +594,3 @@ class BackfillRefreshTests(TestCase):
         self.assertEqual((row.close_price, row.volume), (Decimal("2.5"), 99))
 
 
-class TimeZoneTests(TestCase):
-    def setUp(self):
-        self.user = get_user_model().objects.create_user("tz", password="pw-123456")
-        self.client.force_login(self.user)
-
-    def test_times_shown_in_us_eastern(self):
-        from django.conf import settings
-        from django.utils import timezone as dj_tz
-
-        self.assertEqual(settings.TIME_ZONE, "America/New_York")
-        account = BrokerageAccount.objects.create(
-            user=self.user, snaptrade_user_id="u", snaptrade_user_secret="s", account_id="a"
-        )
-        log = TradeLog.objects.create(account=account, symbol="AAPL", action="BUY", quantity=1, status="SKIPPED")
-        # 15:00 UTC on a winter day is 10:00 EST.
-        TradeLog.objects.filter(pk=log.pk).update(created_at=datetime(2026, 1, 15, 15, 0, tzinfo=dt_tz.utc))
-        with mock.patch("trading.views.SnapTradeService", side_effect=SnapTradeServiceError("no keys")):
-            html = self.client.get(reverse("trading:dashboard")).content.decode()
-        self.assertIn("Jan 15, 10:00 EST", html)
-        self.assertIn('id="mkt-clock"', html)
-        self.assertEqual(str(dj_tz.get_current_timezone()), "America/New_York")
-
-    def test_chart_labels_in_eastern(self):
-        # Massive daily bars are stamped at midnight New York time (05:00 UTC in winter).
-        StockData.objects.bulk_create(
-            StockData(symbol="SPY", timestamp=datetime(2026, 1, 5, 5, 0, tzinfo=dt_tz.utc) + timedelta(days=i),
-                      open_price=1, high_price=1, low_price=1, close_price=100 + i, volume=1)
-            for i in range(15)
-        )
-        strategy = StrategyConfig.objects.create(name="s", symbol="SPY", short_window=3, long_window=10)
-        labels = self.client.get(reverse("trading:strategy_chart", args=[strategy.pk])).json()["labels"]
-        self.assertEqual(labels[0], "2026-01-05T00:00:00-05:00")
-
-    def test_scheduler_converts_to_new_york(self):
-        from trading.management.commands.run_scheduler import market_is_open
-
-        # 14:45 UTC on a Monday = 09:45 EST (open); 14:15 UTC = 09:15 EST (not yet open).
-        self.assertTrue(market_is_open(datetime(2026, 11, 2, 14, 45, tzinfo=dt_tz.utc)))
-        self.assertFalse(market_is_open(datetime(2026, 11, 2, 14, 15, tzinfo=dt_tz.utc)))

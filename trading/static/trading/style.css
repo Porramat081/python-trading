@@ -84,3 +84,11 @@ td.note { white-space: normal; color: var(--muted); font-size: 12px; max-width: 
 .clock[data-state="open"] .dot { background: var(--up); box-shadow: 0 0 0 3px #d1fae5; }
 .clock[data-state="open"] .clock-status { color: var(--up); }
 .clock[data-state="pre"] .dot, .clock[data-state="after"] .dot { background: var(--warn); }
+
+.autobox { display: flex; align-items: center; gap: 12px; }
+.tag { font-size: 11px; padding: 1px 6px; border-radius: 99px; background: var(--soft); border: 1px solid var(--line); color: var(--muted); }
+.grid2 { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 12px; }
+.grid2 label { display: grid; gap: 4px; font-size: 13px; color: var(--muted); }
+.grid2 input, .grid2 select { width: 100%; }
+.btn.err { color: var(--down); }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }

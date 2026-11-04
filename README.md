@@ -2,11 +2,13 @@
 
 A private Django trading bot that:
 
-- **Backfills market data** from the [Massive](https://massive.com) (formerly Polygon.io) aggregates API into `StockData`.
-- **Runs a momentum strategy:** a moving-average crossover (SMA or EMA) computed with pandas.
-- **Fully automatic:** adding a strategy backfills its data, evaluates it, switches it ON and enters a position
-  if the trend is up. A built-in scheduler keeps every active strategy running during market hours.
-- **Places orders on Alpaca** through the [SnapTrade](https://snaptrade.com) API.
+- **Day trades US stocks intraday** following [`docs/day_trading_strategy.md`](docs/day_trading_strategy.md): a daily 50 SMA trend filter, then
+  5- or 15-minute 9/21 EMA crosses confirmed by RSI (14) and MACD (12/26/9).
+- **Fully automatic:** every morning an **auto screener** (Massive top gainers or most active) builds the
+  New Stock List. A loop every 1–5 minutes manages holdings and the Observe List. **Everything is sold by
+  3:45 PM ET**, so nothing is held overnight.
+- **Places orders on Alpaca** through the [SnapTrade](https://snaptrade.com) API: limit buys at ask + $0.02,
+  market sells.
 - **Provides a web dashboard** (Django templates + Chart.js) and **Django admin** tools.
 
 > ⚠️ **Safety defaults.** `TRADING_ENABLED=False` (dry run: signals are logged but no orders are sent), and
@@ -20,14 +22,15 @@ run.py                       # one-command launcher: migrate + web server + sche
 algo_trader/                 # project config (settings, urls, wsgi/asgi)
 trading/                     # main app: models, views, admin, templates, management commands
   management/commands/
-    run_scheduler.py         # python manage.py run_scheduler  (keeps active strategies running)
-    run_strategy.py          # python manage.py run_strategy --symbol AAPL
+    run_scheduler.py         # python manage.py run_scheduler  (the day-trading loop)
+    run_daytrade.py          # python manage.py run_daytrade [--scan | --liquidate | --force]
     backfill_data.py         # python manage.py backfill_data --symbol AAPL --days 365
-  templates/trading/         # dashboard.html, positions.html, strategies.html, ...
+  templates/trading/         # dashboard.html, strategy.html, positions.html
 services/
   massive_service.py         # Massive REST client + fetch_historical_data() backfill
   snaptrade_service.py       # SnapTrade SDK wrapper: register, connect link, balances, positions, execute_order()
-  momentum_strategy.py       # SMA/EMA crossover engine -> BUY / SELL / HOLD and order execution
+  indicators.py              # EMA / RSI / MACD / SMA and the spec's signal rules
+  daytrader.py               # day-trading engine: screener, holdings, observe list, stops, 3:45 PM liquidation
 requirements.txt
 .env.example
 ```
@@ -94,78 +97,95 @@ which syncs your accounts. You can also click **Sync accounts** at any time.
 | `TRADING_ENABLED` | `False` | Must be `True` for any order to be sent |
 | `LIVE_TRADING` | `False` | `True` connects/permits real-money Alpaca (`ALPACA` instead of `ALPACA-PAPER`) |
 
-## Usage
+## Usage: day trading
 
-### 1. Add a strategy
+> ⚠️ **Data plan:** day trading needs **intraday bars** and the **snapshot (screener) endpoints** from Massive,
+> and makes a request per ticker on every loop. The free Massive plan (end-of-day data, 5 requests/min) isn't
+> enough. Use a paid plan, ideally with **real-time** data: with 15-minute-delayed data, every signal is
+> 15 minutes late.
+>
+> ⚠️ **Pattern day trader rule:** US margin accounts with less than $25,000 are limited to 3 day trades in 5
+> business days. Alpaca enforces this, including on paper accounts.
 
-On **Strategies**, type a symbol (e.g. `SPY`, `AAPL`, `MSFT`) and a quantity, then click **Add & start**. The MA
-type and windows (default SMA 10/50) and an optional name are under **Advanced**. If you have exactly one linked
-account, it is selected automatically.
+### 1. Configure the strategy
 
-Adding a strategy automatically:
+Open **Strategy** in the web UI and set the options. The defaults follow the spec:
 
-1. **Backfills** about 2 years of daily candles from Massive.
-2. **Evaluates** the signal and the trend (short MA above the long MA = uptrend).
-3. **Switches the strategy ON.**
-4. **Enters a position (trend-based entry):**
-   - If the signal is BUY, or the trend is up and the signal isn't SELL, it **buys** the quantity now. It skips the
-     buy if you already hold the symbol.
-   - If the signal is SELL, or the trend is down, it **doesn't buy**. It waits for the next BUY crossover.
+| Setting | Default | Meaning |
+|---|---|---|
+| Account | none | Alpaca account for orders. With none (or `TRADING_ENABLED=False`) all fills are **simulated** |
+| Chart timeframe | 5-minute | Execution timeframe (5 or 15 min) |
+| Loop every | 2 min | Monitoring loop interval (1–5 min) |
+| Block size | $1,000 | Dollars per entry block; shares = block ÷ limit price, rounded down |
+| Max blocks / ticker | 2 | Pyramiding cap |
+| Max open positions | 5 | Tickers held at once (protects cash) |
+| Stop-loss | 1.5% | Hard stop below the average entry price |
+| Limit = ask + $ | 0.02 | Limit buy price |
+| Cancel unfilled buy after | 5 min | Unfilled limit buys are cancelled |
+| Liquidate at | 15:45 ET | Sell everything; no new entries after this |
+| Observe expiry | 60 min | Unowned Observe List entries drop off |
+| Screener | Top gainers | Or **Most active** (by volume); filters: price $5–$500, volume ≥ 1M, top 10 |
 
-The same happens when a strategy is added through the Django admin.
+Click **Turn auto ON**. **Scan now**, **Run loop now** and **Close all now** are manual overrides.
 
-### 2. Keep it running: the scheduler
-
-In a second terminal (with the virtual environment activated), run:
-
-```bash
-python manage.py run_scheduler
-```
-
-During US market hours (Mon–Fri 09:30–16:00 New York time), it refreshes recent candles and runs every **ON**
-strategy every 15 minutes. It also does one final run after the close, when the daily candle is complete. Leave it
-running next to `runserver`. Options:
-
-```bash
-python manage.py run_scheduler --interval 5
-```
+### 2. Run it
 
 ```bash
-python manage.py run_scheduler --once
+python run.py
 ```
 
-`--ignore-market-hours` runs around the clock. Exchange holidays aren't detected; on those days the runs just
-find no new data.
+This starts the web server plus `run_scheduler`, which runs the loop every *N* minutes during market hours
+(09:30–16:00 ET) while auto is ON. It wakes up exactly at the liquidation time.
 
-### Manual commands (optional)
+### What each loop does
+
+1. **Liquidation (at or after 3:45 PM ET):** cancels pending buys, market-sells every bot position, and clears
+   the Observe List.
+2. **Pending orders:** applies broker fills. Limit buys not filled within the timeout are cancelled.
+3. **Case 2, current holdings:**
+   - **Stop-loss:** price ≤ entry − 1.5% → market sell.
+   - **Exit:** 9 EMA crosses below 21 EMA, or the MACD histogram turns negative → market sell.
+   - **Add-on (pyramiding):** 9 EMA > 21 EMA, RSI bounced off 50, MACD expanding, and fewer than 2 blocks
+     held → buy 1 more block.
+   - **Momentum warning:** RSI < 40, or price closed below the 9 EMA in an uptrend → flagged on the Observe
+     List. The position is kept until an exit or stop.
+4. **Case 3, Observe List:**
+   - Unowned entries older than 60 min are removed.
+   - Otherwise a **confirmation buy** fires when 9 EMA > 21 EMA, RSI is 45–65 and the MACD histogram is
+     positive and growing.
+5. **Case 1, morning screener (first loop of the day, or Scan now):** for each candidate:
+   - **Skip** if already held (bot positions and your Alpaca holdings).
+   - **Discard** if the price is below the daily 50 SMA.
+   - **Buy** if 9/21 EMA bullish cross + RSI 45–65 + MACD expanding.
+   - **Observe** if uptrend but momentum isn't confirmed yet.
+   - **Discard** if bearish.
+
+Signals use **closed bars only**, and only regular-session bars (09:30–16:00 ET). Stops use the latest price,
+so they're checked once per loop: price can move past the stop between loops.
+
+### Dry run vs. real orders
+
+| `TRADING_ENABLED` | Account set | Behaviour |
+|---|---|---|
+| `False` (default) | any | **Simulated**: buys fill at the limit price, sells at the last price. Shown as "Simulated (dry run)" |
+| `True` | Alpaca paper | Real orders to your **paper** account |
+| `True` + `LIVE_TRADING=True` | Alpaca live | Real money |
+
+### Manual commands
 
 ```bash
-python manage.py backfill_data --symbol AAPL MSFT --days 730
+python manage.py run_daytrade --scan
 ```
 
 ```bash
-python manage.py run_strategy --symbol AAPL
+python manage.py run_daytrade --force
 ```
 
 ```bash
-python manage.py run_strategy --strategy-id 1 --evaluate-only
+python manage.py run_daytrade --liquidate
 ```
 
-If you'd rather use cron than `run_scheduler`, schedule `run_strategy --all --backfill-days 5`.
-On **Strategies**, each row also has **Run** (evaluate now) and an **Auto** switch to turn a strategy on or off.
-
-### Signal logic
-
-On the latest candle:
-
-- **BUY:** the short MA crosses **above** the long MA.
-- **SELL:** the short MA crosses **below** the long MA. The order is capped at the units currently held; with no
-  position, the bot never shorts.
-- **HOLD:** otherwise.
-
-Each crossover candle is acted on only once (`StrategyConfig.last_signal_bar`), so running the command repeatedly
-won't duplicate orders. Every attempt is recorded in `TradeLog` with one of these statuses: `PENDING`, `EXECUTED`,
-`FAILED`, or `SKIPPED` (dry run / nothing to sell).
+`--force` runs one full loop even when the market is closed.
 
 ### Time zone
 

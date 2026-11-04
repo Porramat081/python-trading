@@ -6,53 +6,118 @@
     <div class="muted small">Portfolio value</div>
     <div class="total">${{ total_value|floatformat:2 }}</div>
     <div class="accounts small">
+      <span>Today: realized <b class="{% if realized >= 0 %}up{% else %}down{% endif %}">{% if realized < 0 %}-{% endif %}${{ realized|floatformat:2|cut:"-" }}</b></span>
+      <span>open P&amp;L <b class="{% if unrealized >= 0 %}up{% else %}down{% endif %}">{% if unrealized < 0 %}-{% endif %}${{ unrealized|floatformat:2|cut:"-" }}</b></span>
       {% for card in account_cards %}
-        <span>{{ card.account.account_name|default:"Alpaca" }} · {% if card.account.is_paper %}paper{% else %}live{% endif %}
-          {% if card.error %}<span class="err" title="{{ card.error }}">· unavailable</span>
-          {% elif card.balance %}· cash ${{ card.balance.cash|floatformat:2 }}{% endif %}</span>
+        <span>{{ card.account.account_name|default:"Alpaca" }} · {% if card.account.is_paper %}paper{% else %}live{% endif %}{% if card.error %} <span class="err" title="{{ card.error }}">· unavailable</span>{% endif %}</span>
       {% empty %}
-        <span>{% if has_pending_registration %}Finish the SnapTrade connection, then sync.{% else %}No brokerage account linked.{% endif %}</span>
+        <span>{% if has_pending_registration %}Finish the SnapTrade connection, then sync.{% else %}No broker linked — trades are simulated.{% endif %}</span>
       {% endfor %}
     </div>
   </div>
-  <div>
-    {% if account_cards or has_pending_registration %}
-    <form method="post" action="{% url 'trading:sync_accounts' %}" class="inline">{% csrf_token %}<button class="btn">Sync</button></form>
-    {% endif %}
+  <div class="autobox">
+    <form method="post" action="{% url 'trading:toggle_auto' %}" class="inline">{% csrf_token %}
+      <button class="switch {% if cfg.auto_trading %}on{% endif %}" aria-label="Toggle automatic day trading"></button>
+    </form>
+    <span><b>Auto day trading {% if cfg.auto_trading %}ON{% else %}OFF{% endif %}</b><br>
+      <span class="muted small">{% if cfg.last_cycle_at %}last loop {{ cfg.last_cycle_at|date:"H:i T" }}{% else %}no loop yet{% endif %}
+      · liquidates {{ cfg.liquidate_at|time:"H:i" }} ET</span></span>
     {% if not account_cards %}
     <form method="post" action="{% url 'trading:connect_brokerage' %}" class="inline">{% csrf_token %}
-      <button class="btn dark">Connect Alpaca{% if not LIVE_TRADING %} paper{% endif %}</button>
+      <button class="btn">Connect Alpaca{% if not LIVE_TRADING %} paper{% endif %}</button>
     </form>
     {% endif %}
   </div>
 </div>
 
-<h2>Chart</h2>
-{% if strategies %}
-  <div class="tabs">
-    {% for s in strategies %}<a href="?strategy={{ s.pk }}" {% if s.pk == selected_strategy.pk %}class="on"{% endif %}>{{ s.symbol }}</a>{% endfor %}
-  </div>
-  <p class="muted small">
-    {{ selected_strategy.ma_type }} {{ selected_strategy.short_window }}/{{ selected_strategy.long_window }}
-    {% if selected_strategy.trend %}· trend <span class="{{ selected_strategy.trend|lower }}">{% if selected_strategy.trend == 'UP' %}▲ up{% else %}▼ down{% endif %}</span>{% endif %}
-    {% if selected_strategy.last_signal %}· signal {{ selected_strategy.last_signal }}{% endif %}
-    {% if selected_strategy.last_run %}· checked {{ selected_strategy.last_run|date:"M j, H:i T" }}{% endif %}
-  </p>
-  {% if candle_count %}<div class="chart"><canvas id="priceChart"></canvas></div>
-  {% else %}<p class="muted">No price data yet — it is fetched automatically on the next run.</p>{% endif %}
+<h2>Current holdings</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Symbol</th><th>Status</th><th class="num">Blocks</th><th class="num">Qty</th><th class="num">Entry</th><th class="num">Last</th><th class="num">Stop</th><th class="num">P&amp;L</th><th>Opened (ET)</th><th></th></tr></thead>
+  <tbody>
+  {% for p in open_positions %}
+    <tr>
+      <td><a href="?symbol={{ p.symbol }}"><strong>{{ p.symbol }}</strong></a>{% if p.simulated %} <span class="tag">sim</span>{% endif %}</td>
+      <td class="muted">{{ p.get_status_display }}</td>
+      <td class="num">{{ p.blocks }}/{{ cfg.max_blocks }}</td>
+      <td class="num">{{ p.quantity|floatformat:"-4" }}</td>
+      <td class="num">{{ p.avg_price|floatformat:2 }}</td>
+      <td class="num">{{ p.last_price|floatformat:2|default:"—" }}</td>
+      <td class="num down">{{ p.stop_price|floatformat:2 }}</td>
+      <td class="num {% if p.pnl >= 0 %}up{% else %}down{% endif %}">{% if p.pnl is not None %}{{ p.pnl|floatformat:2 }} ({{ p.pnl_pct|floatformat:2 }}%){% else %}—{% endif %}</td>
+      <td class="muted">{{ p.opened_at|date:"H:i" }}</td>
+      <td class="num">{% if p.status == 'OPEN' %}
+        <form method="post" action="{% url 'trading:position_close' p.pk %}" class="inline" onsubmit="return confirm('Sell {{ p.symbol }} now at market?');">{% csrf_token %}<button class="quiet err">Close</button></form>
+      {% endif %}</td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="10" class="muted">No open positions.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% if closed_today %}<p class="muted small">Closed today: {% for p in closed_today %}{{ p.symbol }} <span class="{% if p.pnl >= 0 %}up{% else %}down{% endif %}">{{ p.pnl_pct|floatformat:2 }}%</span> ({{ p.exit_reason }}){% if not forloop.last %} · {% endif %}{% endfor %}</p>{% endif %}
+
+<h2>Observe list</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Symbol</th><th>Why</th><th>Added (ET)</th><th>Expires</th><th>Note</th><th></th></tr></thead>
+  <tbody>
+  {% for o in observe %}
+    <tr>
+      <td><a href="?symbol={{ o.item.symbol }}"><strong>{{ o.item.symbol }}</strong></a></td>
+      <td class="{% if o.item.reason == 'WARNING' %}down{% else %}muted{% endif %}">{{ o.item.get_reason_display }}</td>
+      <td class="muted">{{ o.item.added_at|date:"H:i" }}</td>
+      <td class="muted">{% if o.owned %}while held{% else %}{{ o.expires|date:"H:i" }}{% endif %}</td>
+      <td class="note">{{ o.item.note }}</td>
+      <td class="num"><form method="post" action="{% url 'trading:observe_remove' o.item.pk %}" class="inline">{% csrf_token %}<button class="quiet">Remove</button></form></td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="6" class="muted">Empty.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h2>Chart{% if selected_symbol %} · {{ selected_symbol }} {{ cfg.timeframe_minutes }}-min{% endif %}</h2>
+{% if chart_symbols %}<div class="tabs">{% for s in chart_symbols %}<a href="?symbol={{ s }}" {% if s == selected_symbol %}class="on"{% endif %}>{{ s }}</a>{% endfor %}</div>{% endif %}
+{% if selected_symbol %}
+  <div class="chart"><canvas id="priceChart"></canvas></div>
 {% else %}
-  <p class="muted">No strategies yet. <a href="{% url 'trading:strategies' %}">Add one</a>.</p>
+  <p class="muted">Charts appear for held and observed tickers. Add <code>?symbol=AAPL</code> to the URL for any other.</p>
 {% endif %}
 
-<h2>Recent trades</h2>
+<h2>Morning scan{% if last_scan %} · {{ last_scan.scanned_at|date:"M j, H:i T" }}{% endif %}</h2>
+<div class="scroll">
+<table>
+  <thead><tr><th>Symbol</th><th class="num">Price</th><th class="num">Change</th><th class="num">Volume</th><th class="num">Daily SMA50</th><th>Result</th><th>Detail</th></tr></thead>
+  <tbody>
+  {% for r in scan_rows %}
+    <tr>
+      <td><strong>{{ r.symbol }}</strong></td>
+      <td class="num">{{ r.price|floatformat:2 }}</td>
+      <td class="num">{{ r.change_pct|floatformat:2 }}%</td>
+      <td class="num">{{ r.volume|default:0 }}</td>
+      <td class="num">{{ r.daily_sma50|floatformat:2|default:"—" }}</td>
+      <td class="{% if r.outcome == 'BUY' %}up{% elif r.outcome == 'OBSERVE' %}{% else %}muted{% endif %}">{{ r.get_outcome_display }}</td>
+      <td class="note">{{ r.note }}</td>
+    </tr>
+  {% empty %}
+    <tr><td colspan="7" class="muted">No scan yet. It runs automatically on the first loop after 09:30 ET, or use “Scan now” on the Strategy page.</td></tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+
+<h2>Recent orders</h2>
 {% include "trading/_trade_table.html" with trades=recent_trades %}
 {% endblock %}
 
 {% block scripts %}
-{% if selected_strategy and candle_count %}
+{% if selected_symbol %}
 {% load static %}
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
-<script>window.CHART_URL = "{% url 'trading:strategy_chart' selected_strategy.pk %}";</script>
+<script>window.CHART_URL = "{% url 'trading:chart' selected_symbol %}";</script>
 <script src="{% static 'trading/chart.js' %}"></script>
 {% endif %}
 {% endblock %}

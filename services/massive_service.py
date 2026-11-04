@@ -8,7 +8,8 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time as dtime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from decimal import Decimal
 
 import requests
@@ -130,6 +131,47 @@ class MassiveClient:
             url = payload.get("next_url")
             params = None
         return candles
+
+    def get_intraday_bars(self, symbol: str, minutes: int, days_back: int = 5) -> list[Candle]:
+        """Intraday bars (e.g. 5- or 15-minute) for the last few days, regular session only.
+        Earlier sessions are included so EMA/MACD have enough warm-up at the open."""
+        end = datetime.now(NEW_YORK).date()
+        start = end - timedelta(days=days_back)
+        bars = self.get_aggregates(symbol, start, end, multiplier=minutes, timespan="minute")
+        return [b for b in bars if _in_regular_session(b.timestamp)]
+
+    # -- screener (snapshot endpoints; need a Massive plan with snapshot access) ---------
+    def get_gainers(self) -> list[dict]:
+        """Today's top gaining US stocks (about 20)."""
+        payload = self._get(f"{self.base_url}/v2/snapshot/locale/us/markets/stocks/gainers")
+        return [_snapshot_row(t) for t in payload.get("tickers") or []]
+
+    def get_all_snapshots(self) -> list[dict]:
+        """Snapshot of every US stock (used to rank the most active by volume)."""
+        payload = self._get(f"{self.base_url}/v2/snapshot/locale/us/markets/stocks/tickers")
+        return [_snapshot_row(t) for t in payload.get("tickers") or []]
+
+
+NEW_YORK = ZoneInfo("America/New_York")
+SESSION_OPEN, SESSION_CLOSE = dtime(9, 30), dtime(16, 0)
+
+
+def _in_regular_session(ts: datetime) -> bool:
+    local = ts.astimezone(NEW_YORK)
+    return local.weekday() < 5 and SESSION_OPEN <= local.time() < SESSION_CLOSE
+
+
+def _snapshot_row(t: dict) -> dict:
+    """Normalise a Massive snapshot ticker into {symbol, price, volume, change_pct}."""
+    day, minute, last = t.get("day") or {}, t.get("min") or {}, t.get("lastTrade") or {}
+    price = last.get("p") or minute.get("c") or day.get("c") or 0
+    volume = day.get("v") or minute.get("av") or 0
+    return {
+        "symbol": str(t.get("ticker", "")).upper(),
+        "price": float(price or 0),
+        "volume": int(volume or 0),
+        "change_pct": float(t.get("todaysChangePerc") or 0),
+    }
 
 
 def _iso(value: date | str) -> str:
