@@ -92,3 +92,5 @@ td.note { white-space: normal; color: var(--muted); font-size: 12px; max-width: 
 .grid2 input, .grid2 select { width: 100%; }
 .btn.err { color: var(--down); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.grid2 label.wide { grid-column: 1 / -1; }
+.grid2 textarea { width: 100%; font: inherit; padding: 7px 10px; border: 1px solid var(--line); border-radius: 8px; }

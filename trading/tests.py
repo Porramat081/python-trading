@@ -68,7 +68,9 @@ class FakeData:
     def daily_closes(self, symbol, now):
         return self.daily.get(symbol, pd.Series(dtype=float))
 
-    def screener(self, source):
+    def screener(self, source, watchlist=None):
+        if source == "WATCHLIST":
+            return [{"symbol": w, "price": None, "volume": None, "change_pct": None} for w in watchlist or []]
         return self.rows
 
 
@@ -388,7 +390,7 @@ class ViewTests(TestCase):
 
     def test_save_settings_and_toggle(self):
         data = {
-            "account": "", "timeframe_minutes": 15, "loop_minutes": 3, "block_usd": "2500", "max_blocks": 2,
+            "account": "", "data_provider": "ALPACA", "timeframe_minutes": 15, "loop_minutes": 3, "block_usd": "2500", "max_blocks": 2,
             "max_open_positions": 4, "stop_loss_pct": "1.5", "limit_offset": "0.02", "buy_timeout_minutes": 5,
             "liquidate_at": "15:45", "observe_minutes": 60, "screener_source": "MOST_ACTIVE", "screener_count": 8,
             "min_price": "5", "max_price": "300", "min_volume": 2000000,
@@ -404,7 +406,7 @@ class ViewTests(TestCase):
     def test_close_position_and_close_all(self):
         pos = open_position("AAA")
         open_position("BBB")
-        with mock.patch("services.daytrader.MassiveData") as md:
+        with mock.patch("services.daytrader.get_market_data") as md:
             md.return_value.intraday.return_value = Bars(pd.Series(dtype=float), 98.0)
             self.client.post(reverse("trading:position_close", args=[pos.pk]))
             pos.refresh_from_db()
@@ -415,7 +417,7 @@ class ViewTests(TestCase):
     def test_chart_endpoint(self):
         s = closes(*BUY)
         idx = pd.date_range("2026-11-02 14:30", periods=len(s), freq="5min", tz="UTC")
-        with mock.patch("trading.views.MassiveData") as md:
+        with mock.patch("trading.views.get_market_data") as md:
             md.return_value.intraday.return_value = Bars(pd.Series(s.values, index=idx), 97.0)
             data = self.client.get(reverse("trading:chart", args=["aaa"])).json()
         self.assertEqual(data["symbol"], "AAA")
@@ -432,14 +434,14 @@ class ViewTests(TestCase):
 class CommandTests(TestCase):
     def test_run_daytrade_scan(self):
         out = StringIO()
-        with mock.patch("services.daytrader.MassiveData") as md:
+        with mock.patch("services.daytrader.get_market_data") as md:
             md.return_value.screener.return_value = []
             call_command("run_daytrade", "--scan", stdout=out)
         self.assertIn("Scanned 0 candidates", out.getvalue())
 
     def test_run_daytrade_liquidate(self):
         open_position("AAA")
-        with mock.patch("services.daytrader.MassiveData") as md:
+        with mock.patch("services.daytrader.get_market_data") as md:
             md.return_value.intraday.return_value = Bars(pd.Series(dtype=float), 98.0)
             call_command("run_daytrade", "--liquidate", stdout=StringIO())
         self.assertEqual(Position.objects.get().exit_reason, "Manual")
@@ -594,3 +596,202 @@ class BackfillRefreshTests(TestCase):
         self.assertEqual((row.close_price, row.volume), (Decimal("2.5"), 99))
 
 
+
+
+# ---------------------------------------------------------------------------------
+# Alpaca market data (free IEX feed)
+# ---------------------------------------------------------------------------------
+from types import SimpleNamespace as NS  # noqa: E402
+
+from services.alpaca_data import AlpacaData, AlpacaDataError  # noqa: E402
+from services.daytrader import get_market_data, parse_watchlist  # noqa: E402
+
+
+def ny(h, m, day=2):
+    return datetime(2026, 11, day, h, m, tzinfo=NY).astimezone(dt_tz.utc)
+
+
+class FakeAlpacaBars:
+    def __init__(self):
+        self.bar_requests = []
+        self.bars = {}
+        self.snaps = {}
+        self.quotes = {}
+
+    def get_stock_bars(self, req):
+        self.bar_requests.append(req)
+        syms = req.symbol_or_symbols if isinstance(req.symbol_or_symbols, list) else [req.symbol_or_symbols]
+        return NS(data={s: self.bars.get(s, []) for s in syms if s in self.bars})
+
+    def get_stock_snapshot(self, req):
+        return {s: self.snaps[s] for s in req.symbol_or_symbols if s in self.snaps}
+
+    def get_stock_latest_quote(self, req):
+        return {k: v for k, v in self.quotes.items()}
+
+
+class FakeScreener:
+    def __init__(self, gainers=(), actives=(), fail=False):
+        self.gainers, self.actives, self.fail = list(gainers), list(actives), fail
+
+    def get_market_movers(self, req):
+        if self.fail:
+            raise RuntimeError("forbidden")
+        return NS(gainers=self.gainers, losers=[])
+
+    def get_most_actives(self, req):
+        if self.fail:
+            raise RuntimeError("forbidden")
+        return NS(most_actives=self.actives)
+
+
+def bar(ts, close):
+    return NS(timestamp=ts, open=close, high=close, low=close, close=close, volume=100)
+
+
+class AlpacaDataTests(TestCase):
+    def setUp(self):
+        self.bars = FakeAlpacaBars()
+
+    def data(self, **screener):
+        return AlpacaData(bars_client=self.bars, screener_client=FakeScreener(**screener))
+
+    def test_intraday_batched_session_filtered_and_closed_only(self):
+        self.bars.bars = {
+            "AAA": [bar(ny(8, 0), 1), bar(ny(9, 30), 2), bar(ny(9, 35), 3), bar(ny(9, 40), 4)],
+            "BBB": [bar(ny(9, 30), 10)],
+        }
+        out = self.data().intraday_many(["aaa", "BBB", "CCC"], 5, ny(9, 42))
+        self.assertEqual(len(self.bars.bar_requests), 1)                  # one request for all symbols
+        self.assertEqual(self.bars.bar_requests[0].feed.value, "iex")
+        self.assertEqual(list(out["AAA"].closed), [2.0, 3.0])            # 08:00 dropped; 09:40 still forming
+        self.assertEqual(out["AAA"].last_price, 4.0)
+        self.assertEqual(out["CCC"].last_price, None)
+
+    def test_daily_closes_exclude_today_and_cache(self):
+        self.bars.bars = {"AAA": [bar(ny(0, 0, day=d), float(d)) for d in (1, 2)]}
+        d = self.data()
+        self.assertEqual(list(d.daily_closes("AAA", ny(11, 0, day=2))), [1.0])
+        d.daily_closes("AAA", ny(11, 0, day=2))
+        self.assertEqual(len(self.bars.bar_requests), 1)
+
+    def test_screeners(self):
+        self.bars.snaps = {
+            "ACT": NS(latest_trade=NS(price=20.0), daily_bar=NS(close=20.0, volume=5), previous_daily_bar=NS(close=16.0)),
+        }
+        gainers = [NS(symbol="UP", price=12.5, percent_change=30.0), NS(symbol="ACT", price=20.0, percent_change=25.0)]
+        actives = [NS(symbol="ACT", volume=9_000_000, trade_count=1)]
+        d = self.data(gainers=gainers, actives=actives)
+        g = {r["symbol"]: r for r in d.screener("GAINERS")}
+        self.assertEqual((g["UP"]["volume"], g["ACT"]["volume"]), (0, 9_000_000))  # volume from most-actives
+        m = d.screener("MOST_ACTIVE")
+        self.assertEqual(m, [{"symbol": "ACT", "price": 20.0, "volume": 9_000_000, "change_pct": 25.0}])
+        w = d.screener("WATCHLIST", watchlist=["ACT"])
+        self.assertEqual((w[0]["price"], w[0]["volume"]), (20.0, None))
+
+    def test_quote_and_missing_keys(self):
+        self.bars.quotes = {"AAA": NS(ask_price=101.25)}
+        self.assertEqual(self.data().quote_ask("aaa"), 101.25)
+        with override_settings(ALPACA_API_KEY_ID="", ALPACA_API_SECRET_KEY=""):
+            with self.assertRaises(AlpacaDataError):
+                AlpacaData()
+
+    def test_errors_are_explained(self):
+        class Denied(FakeAlpacaBars):
+            def get_stock_bars(self, req):
+                err = RuntimeError("forbidden")
+                err.status_code = 403
+                raise err
+
+        d = AlpacaData(bars_client=Denied(), screener_client=FakeScreener())
+        with self.assertRaisesRegex(AlpacaDataError, "check ALPACA_API_KEY_ID"):
+            d.intraday("AAA", 5, ny(10, 0))
+        checks = d.test()
+        self.assertFalse(checks[0][0])
+        self.assertTrue(checks[3][0])  # screener still works
+
+    def test_provider_choice(self):
+        cfg = DayTradeSettings.load()
+        self.assertEqual(cfg.data_provider, "ALPACA")
+        with override_settings(ALPACA_API_KEY_ID="k", ALPACA_API_SECRET_KEY="s"):
+            self.assertIsInstance(get_market_data(cfg), AlpacaData)
+        cfg.data_provider = "MASSIVE"
+        with override_settings(MASSIVE_API_KEY="m"):
+            self.assertEqual(type(get_market_data(cfg)).__name__, "MassiveData")
+
+
+class WatchlistAndBatchingTests(TestCase):
+    def test_parse_watchlist(self):
+        self.assertEqual(parse_watchlist(" spy, aapl  NVDA;tsla,spy "), ["SPY", "AAPL", "NVDA", "TSLA"])
+
+    def test_watchlist_fallback_when_screener_fails(self):
+        class Failing(FakeData):
+            def screener(self, source, watchlist=None):
+                if source != "WATCHLIST":
+                    raise AlpacaDataError("screener forbidden")
+                return super().screener(source, watchlist)
+
+        data = Failing()
+        data.set("AAA", BUY)
+        t = trader(data, watchlist="AAA")
+        t.scan()
+        self.assertIn("using your watchlist", str(t.report))
+        result = ScanResult.objects.get()
+        self.assertEqual((result.symbol, result.outcome), ("AAA", "BUY"))
+        self.assertIsNotNone(result.price)
+
+    def test_watchlist_ignores_filters(self):
+        data = FakeData()
+        t = trader(data, screener_source="WATCHLIST", watchlist="AAA, BBB", min_volume=10**9, screener_count=1)
+        self.assertEqual([r["symbol"] for r in t.candidates()], ["AAA", "BBB"])
+
+    def test_loop_prefetches_tracked_symbols_in_one_batch(self):
+        class Batching(FakeData):
+            def __init__(self):
+                super().__init__()
+                self.batches = []
+
+            def intraday_many(self, symbols, minutes, now):
+                self.batches.append(sorted(symbols))
+                return {s: self.intraday(s, minutes, now) for s in symbols}
+
+        data = Batching()
+        data.set("AAA", DEVELOPING)
+        data.set("BBB", DEVELOPING)
+        open_position("AAA", avg="90")
+        ObserveItem.objects.create(symbol="BBB")
+        t = trader(data)
+        t.cfg.last_scan_at = MONDAY_1030
+        t.cfg.save()
+        calls_before = data.calls
+        t.run_cycle()
+        self.assertEqual(data.batches, [["AAA", "BBB"]])
+        self.assertEqual(data.calls - calls_before, 2)  # filled by the batch, no extra per-symbol fetches
+
+    def test_thin_ask_ignored(self):
+        data = FakeData()
+        data.quote_ask = lambda symbol: 150.0  # 50% away from last: bad IEX quote
+        t = trader(data, broker=FakeLiveBroker())
+        self.assertEqual(t._ask_price("AAA", 100.0), 100.0)  # broker ask 100.00 used
+        data.quote_ask = lambda symbol: 100.5
+        self.assertEqual(t._ask_price("AAA", 100.0), 100.5)
+
+    @override_settings(SNAPTRADE_CLIENT_ID="", SNAPTRADE_CONSUMER_KEY="")
+    def test_settings_form_watchlist_validation_and_test_button(self):
+        user = get_user_model().objects.create_user("w", password="pw-123456")
+        self.client.force_login(user)
+        data = {
+            "account": "", "data_provider": "ALPACA", "timeframe_minutes": 5, "loop_minutes": 2, "block_usd": "1000",
+            "max_blocks": 2, "max_open_positions": 5, "stop_loss_pct": "1.5", "limit_offset": "0.02",
+            "buy_timeout_minutes": 5, "liquidate_at": "15:45", "observe_minutes": 60, "screener_source": "WATCHLIST",
+            "screener_count": 10, "min_price": "5", "max_price": "500", "min_volume": 1000000, "watchlist": "",
+        }
+        self.assertContains(self.client.post(reverse("trading:strategy"), data), "Add at least one ticker")
+        self.assertContains(self.client.post(reverse("trading:strategy"), {**data, "watchlist": "spy, BRK.B"}), "Not valid tickers")
+        self.client.post(reverse("trading:strategy"), {**data, "watchlist": "spy aapl"})
+        self.assertEqual(DayTradeSettings.load().watchlist, "SPY, AAPL")
+        with mock.patch("trading.views.get_market_data") as gm:
+            gm.return_value.test.return_value = [(True, "5-min bars (SPY, IEX): 300 closed bars"), (False, "Screener: forbidden")]
+            response = self.client.post(reverse("trading:test_data"), follow=True)
+        self.assertContains(response, "300 closed bars")
+        self.assertContains(response, "Screener: forbidden")

@@ -89,7 +89,9 @@ which syncs your accounts. You can also click **Sync accounts** at any time.
 | `DJANGO_DEBUG` | `True` | |
 | `DJANGO_ALLOWED_HOSTS` | `127.0.0.1,localhost` | Comma-separated |
 | `DATABASE_URL` | *(empty → SQLite)* | `postgres://user:pass@host:5432/db` (requires `pip install "psycopg[binary]"`) |
-| `MASSIVE_API_KEY` | | Massive / Polygon API key |
+| `ALPACA_API_KEY_ID` / `ALPACA_API_SECRET_KEY` | | Alpaca market data keys (default data provider) |
+| `ALPACA_DATA_FEED` | `iex` | `sip` (full market) needs a paid Alpaca data plan |
+| `MASSIVE_API_KEY` | | Massive / Polygon API key (optional provider) |
 | `MASSIVE_BASE_URL` | `https://api.massive.com` | Use `https://api.polygon.io` for legacy keys |
 | `SNAPTRADE_CLIENT_ID` / `SNAPTRADE_CONSUMER_KEY` | | SnapTrade credentials |
 | `SNAPTRADE_KEY_TYPE` | `commercial` | `personal` if you use SnapTrade personal API keys |
@@ -99,10 +101,15 @@ which syncs your accounts. You can also click **Sync accounts** at any time.
 
 ## Usage: day trading
 
-> ⚠️ **Data plan:** day trading needs **intraday bars** and the **snapshot (screener) endpoints** from Massive,
-> and makes a request per ticker on every loop. The free Massive plan (end-of-day data, 5 requests/min) isn't
-> enough. Use a paid plan, ideally with **real-time** data: with 15-minute-delayed data, every signal is
-> 15 minutes late.
+> **Market data:** by default the bot uses **Alpaca's free market data**: real-time prices from the IEX
+> exchange, 200 requests/min, with bars fetched for many tickers in one request. Add your Alpaca API keys to
+> `.env` (`ALPACA_API_KEY_ID`, `ALPACA_API_SECRET_KEY`; paper keys work). Orders still go through SnapTrade.
+> **Massive** is still available as an alternative on the Strategy page, but it needs a paid plan for
+> intraday data and the screener.
+>
+> **IEX caveat:** IEX is one exchange (about 2–3% of US volume). Prices track the full market closely, but
+> thinly traded stocks can have missing 5-minute bars, and indicators can differ slightly from charts based on
+> the full market.
 >
 > ⚠️ **Pattern day trader rule:** US margin accounts with less than $25,000 are limited to 3 day trades in 5
 > business days. Alpaca enforces this, including on paper accounts.
@@ -114,6 +121,7 @@ Open **Strategy** in the web UI and set the options. The defaults follow the spe
 | Setting | Default | Meaning |
 |---|---|---|
 | Account | none | Alpaca account for orders. With none (or `TRADING_ENABLED=False`) all fills are **simulated** |
+| Market data | Alpaca (free IEX) | Or Massive (paid plan) |
 | Chart timeframe | 5-minute | Execution timeframe (5 or 15 min) |
 | Loop every | 2 min | Monitoring loop interval (1–5 min) |
 | Block size | $1,000 | Dollars per entry block; shares = block ÷ limit price, rounded down |
@@ -124,9 +132,16 @@ Open **Strategy** in the web UI and set the options. The defaults follow the spe
 | Cancel unfilled buy after | 5 min | Unfilled limit buys are cancelled |
 | Liquidate at | 15:45 ET | Sell everything; no new entries after this |
 | Observe expiry | 60 min | Unowned Observe List entries drop off |
-| Screener | Top gainers | Or **Most active** (by volume); filters: price $5–$500, volume ≥ 1M, top 10 |
+| Screener | Top gainers | Or **Most active** (by volume), or **My watchlist only**. Filters: price $5–$500, volume ≥ 1M, top 10 |
+| Watchlist | empty | Your tickers. Used when chosen as the screener, and **automatically as a fallback** if the screener fails or returns nothing. Price/volume filters don't apply |
 
-Click **Turn auto ON**. **Scan now**, **Run loop now** and **Close all now** are manual overrides.
+Click **Test data** first. It checks 5-minute bars, daily bars, a quote and both screeners with your keys, and
+shows which ones your plan allows. Then click **Turn auto ON**. **Scan now**, **Run loop now** and
+**Close all now** are manual overrides.
+
+With Alpaca data, the **top gainers** list has no volume figures, so volume comes from Alpaca's top 100 most
+active list. With a minimum volume set, only gainers that are also among the most active pass. That's a
+liquidity guard: set **Min volume** to 0 to allow all gainers.
 
 ### 2. Run it
 

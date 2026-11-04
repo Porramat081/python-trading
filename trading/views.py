@@ -14,7 +14,7 @@ from django.utils import timezone
 from django.views.decorators.http import require_POST
 
 from services import indicators as ind
-from services.daytrader import NEW_YORK, DayTrader, MassiveData
+from services.daytrader import NEW_YORK, DayTrader, get_market_data
 from services.snaptrade_service import SnapTradeService, SnapTradeServiceError
 
 from .forms import DayTradeSettingsForm
@@ -177,6 +177,25 @@ def run_now(request):
 
 @login_required
 @require_POST
+def test_data(request):
+    """Check what the selected market-data provider returns for this account's plan."""
+    cfg = DayTradeSettings.load()
+    try:
+        data = get_market_data(cfg)
+    except Exception as exc:
+        messages.error(request, f"Market data not configured: {exc}")
+        return redirect("trading:strategy")
+    if not hasattr(data, "test"):
+        messages.info(request, "Test is available for the Alpaca provider.")
+        return redirect("trading:strategy")
+    checks = data.test(minutes=cfg.timeframe_minutes)
+    for ok, text in checks:
+        messages.add_message(request, messages.SUCCESS if ok else messages.ERROR, ("✓ " if ok else "✗ ") + text)
+    return redirect("trading:strategy")
+
+
+@login_required
+@require_POST
 def liquidate_now(request):
     trader = DayTrader()
     trader.liquidate_all(reason="MANUAL")
@@ -208,7 +227,7 @@ def chart(request, symbol):
     """5/15-min closes with 9/21 EMA for the dashboard chart (fetched live from Massive)."""
     cfg = DayTradeSettings.load()
     try:
-        bars = MassiveData().intraday(symbol.upper(), cfg.timeframe_minutes, timezone.now())
+        bars = get_market_data(cfg).intraday(symbol.upper(), cfg.timeframe_minutes, timezone.now())
     except Exception as exc:
         return JsonResponse({"error": str(exc)}, status=502)
     closes = bars.closed.tail(200)

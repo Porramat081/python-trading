@@ -12,6 +12,7 @@ urlpatterns = [
     path("strategy/scan/", views.scan_now, name="scan_now"),
     path("strategy/run/", views.run_now, name="run_now"),
     path("strategy/liquidate/", views.liquidate_now, name="liquidate_now"),
+    path("strategy/test-data/", views.test_data, name="test_data"),
     path("holdings/<int:pk>/close/", views.position_close, name="position_close"),
     path("observe/<int:pk>/remove/", views.observe_remove, name="observe_remove"),
     path("chart/<str:symbol>.json", views.chart, name="chart"),

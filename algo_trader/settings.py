@@ -124,6 +124,10 @@ if not DEBUG:
 
 # --- External APIs ------------------------------------------------------
 MASSIVE_API_KEY = os.getenv("MASSIVE_API_KEY", "")
+# Alpaca market data (free plan: real-time IEX feed). Used for prices only; orders go via SnapTrade.
+ALPACA_API_KEY_ID = os.getenv("ALPACA_API_KEY_ID", "")
+ALPACA_API_SECRET_KEY = os.getenv("ALPACA_API_SECRET_KEY", "")
+ALPACA_DATA_FEED = os.getenv("ALPACA_DATA_FEED", "iex")  # "sip" needs a paid Alpaca data plan
 MASSIVE_BASE_URL = os.getenv("MASSIVE_BASE_URL", "https://api.massive.com").rstrip("/")
 
 SNAPTRADE_CLIENT_ID = os.getenv("SNAPTRADE_CLIENT_ID", "")

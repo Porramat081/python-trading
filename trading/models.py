@@ -69,6 +69,18 @@ class DayTradeSettings(models.Model):
     class Source(models.TextChoices):
         GAINERS = "GAINERS", "Top gainers"
         MOST_ACTIVE = "MOST_ACTIVE", "Most active (volume)"
+        WATCHLIST = "WATCHLIST", "My watchlist only"
+
+    class Provider(models.TextChoices):
+        ALPACA = "ALPACA", "Alpaca (free, real-time IEX)"
+        MASSIVE = "MASSIVE", "Massive (paid plan)"
+
+    # Market data
+    data_provider = models.CharField(max_length=8, choices=Provider.choices, default=Provider.ALPACA)
+    watchlist = models.TextField(
+        blank=True, help_text="Tickers separated by commas/spaces. Used as the screener when chosen, "
+        "or as a fallback when the screener fails or returns nothing.",
+    )
 
     # Automation
     auto_trading = models.BooleanField(default=False, help_text="Run the day-trading loop on schedule.")
